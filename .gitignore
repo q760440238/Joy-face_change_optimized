@@ -1,0 +1,25 @@
+# Vendored weights, checkpoints, and compile cache
+deploy/deps/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Runtime artifacts
+deploy/recordings/
+
+# joyomni_ops build artifacts (compiled locally via pip install)
+deploy/joyomni_ops/build/
+deploy/joyomni_ops/**/*.so
+
+# Third-party build checkouts (SageAttention, cutlass -> deploy/tmp/, see DEPLOYMENT.md §2)
+deploy/tmp/
+
+# Hugging Face Space checkout (never commit to the public repo)
+deploy/hf_space/
+*.bak
+*.py.bak
+*.py.orig
+deploy/rv2v_reference/wechat_shota.jpg
+deploy/deps/

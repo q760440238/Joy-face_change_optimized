@@ -1,0 +1,13 @@
+This repository is a modified fork of jd-opensource/JoyAI-Video-Edit
+(https://github.com/jd-opensource/JoyAI-Video-Edit), licensed under Apache-2.0.
+
+Modifications by the fork authors:
+  deploy/static/index.html                              dark theme, branding removed, extra reference presets
+  deploy/xvideo/models/dit/fused_ops_torch.py           NEW - pure PyTorch equivalents of the joyomni_ops kernels
+  deploy/xvideo/models/dit/sgl_fused_ops.py             automatic torch fallback when joyomni_ops is absent
+  deploy/xvideo/models/dit/int4_linear.py               NEW - int4/int8 weight-only Linear (portable)
+  deploy/xvideo/models/models.py                        JOYOMNI_DIT_SD_DIR / JOYOMNI_DIT_INT4_DIR load paths
+  deploy/xvideo/serving/serve_joyomni_streaming.py      reference preset registration
+  tools/                                                quantization + streaming client + equivalence tests
+
+The original LICENSE (Apache-2.0) is retained unchanged.
