@@ -249,9 +249,14 @@ def load_dit(cfg, device: torch.device) -> torch.nn.Module:
                 continue
             child.to(device_obj)
         for block in model.double_blocks:
+            # quantise on the GPU then park: the CUDA FP8 cast rounds slightly
+            # differently from the CPU one, and the mismatch compounds over 40
+            # layers (measured 28.6 dB against the resident build).
+            block.to(device_obj)
             for stream_name in ("img", "txt"):
                 if _fp8_stream_wanted(stream_name):
                     _maybe_install_fp8_stream(block, stream_name)
+            block.to("cpu")
         model._stream_blocks = True
         model._text_stream_offloaded = True
         model._text_stream_paged = True
