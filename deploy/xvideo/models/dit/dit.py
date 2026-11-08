@@ -742,7 +742,14 @@ class WanTimeTextImageEmbedding(nn.Module):
             timestep = timestep.flatten()
         timestep = self.timesteps_proj(timestep)
 
-        time_embedder_dtype = next(iter(self.time_embedder.parameters())).dtype
+        # FP8 Linears keep their weights in buffers, so `parameters()` can be
+        # empty and a float8 dtype is not a valid timestep dtype.
+        _time_embedder_dtype = next(iter(self.time_embedder.parameters()), None)
+        time_embedder_dtype = (
+            _time_embedder_dtype.dtype if _time_embedder_dtype is not None else torch.bfloat16
+        )
+        if time_embedder_dtype not in (torch.float32, torch.float16, torch.bfloat16):
+            time_embedder_dtype = torch.bfloat16
         if timestep.dtype != time_embedder_dtype and time_embedder_dtype != torch.int8:
             timestep = timestep.to(time_embedder_dtype)
         temb = self.time_embedder(timestep).type_as(encoder_hidden_states)
