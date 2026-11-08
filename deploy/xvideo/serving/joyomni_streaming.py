@@ -16,10 +16,16 @@ from PIL import Image
 
 from xvideo.config import ExpConfig, generate_video_image_bucket
 from xvideo.models.models import load_dit, load_pipeline, build_vae
+from xvideo.models.dit import set_text_kv_active
 from xvideo.models.pipeline import (
     PRECISION_TO_TYPE,
 )
-from xvideo.serving.graph_runner import GRAPH_WINDOW_CHUNKS, StreamingGraphRunner, graph_env_enabled
+from xvideo.serving.graph_runner import (
+    GRAPH_WINDOW_CHUNKS,
+    StreamingGraphRunner,
+    graph_env_enabled,
+    text_kv_env_enabled,
+)
 from xvideo.utils import _dynamic_resize_from_bucket, seed_everything
 
 DEFAULT_REFERENCE_IMG_IV2V_BASESIZE = 768
@@ -519,6 +525,9 @@ class JoyOmniV2VStreamingSession:
         self.pending_metas: list[dict[str, Any]] = []
         self.prev_source_frame: torch.Tensor | None = None
         self.ref_image_kv_prefilled = False
+        # One {layer_idx: (txt_k, txt_v)} per denoise step, captured at init
+        # when JOYOMNI_TEXT_KV is on. None keeps the full (text-on) path.
+        self._text_kv_by_step: list[dict[int, tuple[torch.Tensor, torch.Tensor]]] | None = None
 
         self.streaming_cond_embeds: torch.Tensor | None = None
         self.last_chunk_profile: dict[str, Any] | None = None
@@ -677,9 +686,53 @@ class JoyOmniV2VStreamingSession:
             )
             self.ref_image_kv_prefilled = True
 
+        if text_kv_env_enabled():
+            self._text_kv_by_step = self._capture_text_kv_by_step()
+
         self._maybe_prepare_graph_runner()
 
         self.initialized = True
+
+    @torch.no_grad()
+    def _capture_text_kv_by_step(self) -> list[dict[int, tuple[torch.Tensor, torch.Tensor]]]:
+        """Prefill the text stream once per denoise step.
+
+        The prompt is fixed for the session, so only the timestep conditioning
+        differs between steps; anchoring the capture on the reference-image
+        latent keeps the image context the text tokens see stable.
+        """
+        anchor = self.ref_image_latent
+        if anchor is None:
+            anchor = torch.zeros(
+                (1, self.latent_channels, 1, self.latent_h, self.latent_w),
+                device=self.device,
+                dtype=self.target_dtype,
+            )
+        self.pipeline.scheduler.set_timesteps(self.settings.num_inference_steps, device=self.device)
+        started = time.perf_counter()
+        caches = [
+            self.pipeline._prefill_text_kv_cache(
+                self.pipeline.transformer,
+                prompt_embeds=self.streaming_cond_embeds,
+                anchor_latents=anchor,
+                transformer_dtype=self.target_dtype,
+                timestep=float(timestep),
+            )
+            for timestep in self.pipeline.scheduler.timesteps
+        ]
+        layers = len(caches[0]) if caches else 0
+        gib = sum(
+            tensor.numel() * tensor.element_size()
+            for cache in caches
+            for pair in cache.values()
+            for tensor in pair
+        ) / 2 ** 30
+        print(
+            f"#####[TEXT-KV] captured {len(caches)} per-step caches "
+            f"({layers} layers, {gib:.2f} GiB) in {time.perf_counter() - started:.2f}s",
+            flush=True,
+        )
+        return caches
 
     @torch.no_grad()
     def _encode_streaming_prompt(self, anchor_frame: Image.Image) -> None:
@@ -818,7 +871,9 @@ class JoyOmniV2VStreamingSession:
             return None
 
         if runner.bound_token != self._session_serial:
-            runner.bind_session(self._session_serial, self.streaming_cond_embeds)
+            runner.bind_session(
+                self._session_serial, self.streaming_cond_embeds, self._text_kv_by_step
+            )
         if runner.pool_dirty or runner.last_graph_chunk != chunk_idx - 1 or selected_chunk_ids[1] != chunk_idx - 1:
             scope_store = self.pipeline.transformer._inference_kv_cache["cond"]
             sink_mem_id = self.pipeline._kv_cache_memory_id("clean", 0)
@@ -857,6 +912,7 @@ class JoyOmniV2VStreamingSession:
             self._ref_kv_tokens(),
             int(self.settings.max_temporal_ids or 0),
             int(self.settings.num_inference_steps),
+            int(self._text_kv_by_step is not None),
         )
 
     def _maybe_prepare_graph_runner(self) -> None:
@@ -892,6 +948,7 @@ class JoyOmniV2VStreamingSession:
                 ref_tokens=self._ref_kv_tokens(),
                 latent_shape=latent_shape,
                 txt_len=int(self.streaming_cond_embeds.shape[1]),
+                text_kv_by_step=self._text_kv_by_step,
                 max_temporal_ids=int(mti),
                 pos_freqs=self._graph_cached_freqs(pos_table_ids),
                 device=self.device,
@@ -1059,49 +1116,60 @@ class JoyOmniV2VStreamingSession:
         self.pipeline.scheduler.set_timesteps(self.settings.num_inference_steps, device=self.device)
         timesteps_for_chunk = self.pipeline.scheduler.timesteps
 
-        for timestep in timesteps_for_chunk:
-            autocast_context = _autocast_ctx(
-                self.device_type, self.target_dtype, self.autocast_enabled
-            )
-            with autocast_context:
-                latent_model_input = current_chunk_latents.to(self.target_dtype)
-                cache_memory_ids = [
-                    self.pipeline._kv_cache_memory_id("clean", cid) for cid in history_chunk_ids
-                ]
-                if self.ref_image_kv_prefilled:
-                    cache_memory_ids.append(self.pipeline._kv_cache_memory_id("ref_image"))
+        text_kv_caches = self._text_kv_by_step
+        for step_index, timestep in enumerate(timesteps_for_chunk):
+            text_kv = None
+            if text_kv_caches:
+                # num_inference_steps is fixed per session, so the index lines up
+                # with the schedule the cache was captured from.
+                text_kv = text_kv_caches[min(step_index, len(text_kv_caches) - 1)]
+            set_text_kv_active(text_kv)
+            try:
+                autocast_context = _autocast_ctx(
+                    self.device_type, self.target_dtype, self.autocast_enabled
+                )
+                with autocast_context:
+                    latent_model_input = current_chunk_latents.to(self.target_dtype)
+                    cache_memory_ids = [
+                        self.pipeline._kv_cache_memory_id("clean", cid) for cid in history_chunk_ids
+                    ]
+                    if self.ref_image_kv_prefilled:
+                        cache_memory_ids.append(self.pipeline._kv_cache_memory_id("ref_image"))
 
-                t_expand = timestep.repeat(latent_model_input.shape[0])
-                with self.pipeline.transformer.cache_context("cond"):
-                    started = self._timer_start(self.device)
-                    noise_pred = self.pipeline.transformer(
-                        hidden_states=latent_model_input,
-                        timestep=t_expand,
-                        encoder_hidden_states=self.streaming_cond_embeds,
-                        ref_video_latent=ref_chunk_latent,
-                        current_temporal_ids=current_chunk_temporal_ids.unsqueeze(0).expand(
-                            latent_model_input.shape[0], -1
-                        ),
-                        cached_temporal_ids=(
-                            cached_temporal_ids.unsqueeze(0).expand(latent_model_input.shape[0], -1)
-                            if cached_temporal_ids is not None
-                            else None
-                        ),
-                        kv_cache_mode="reuse",
-                        kv_cache_scope="cond",
-                        kv_cache_chunk_id=active_chunk_id,
-                        kv_cache_selected_chunk_ids=cache_memory_ids,
-                        kv_cache_pre_rope=True,
+                    t_expand = timestep.repeat(latent_model_input.shape[0])
+                    with self.pipeline.transformer.cache_context("cond"):
+                        started = self._timer_start(self.device)
+                        noise_pred = self.pipeline.transformer(
+                            hidden_states=latent_model_input,
+                            timestep=t_expand,
+                            encoder_hidden_states=self.streaming_cond_embeds,
+                            ref_video_latent=ref_chunk_latent,
+                            current_temporal_ids=current_chunk_temporal_ids.unsqueeze(0).expand(
+                                latent_model_input.shape[0], -1
+                            ),
+                            cached_temporal_ids=(
+                                cached_temporal_ids.unsqueeze(0).expand(latent_model_input.shape[0], -1)
+                                if cached_temporal_ids is not None
+                                else None
+                            ),
+                            kv_cache_mode="reuse",
+                            kv_cache_scope="cond",
+                            kv_cache_chunk_id=active_chunk_id,
+                            kv_cache_selected_chunk_ids=cache_memory_ids,
+                            kv_cache_pre_rope=True,
+                            skip_text_stream=text_kv is not None,
+                        )[0]
+                        self._timer_record(profile, "dit_forward_cond_s", started)
+
+                    sample_for_step = current_chunk_latents.clone()
+                    current_chunk_latents = self.pipeline.scheduler.step(
+                        noise_pred,
+                        timestep,
+                        sample_for_step,
+                        return_dict=False,
                     )[0]
-                    self._timer_record(profile, "dit_forward_cond_s", started)
-
-                sample_for_step = current_chunk_latents.clone()
-                current_chunk_latents = self.pipeline.scheduler.step(
-                    noise_pred,
-                    timestep,
-                    sample_for_step,
-                    return_dict=False,
-                )[0]
+            finally:
+                set_text_kv_active(None)
 
         keep_before_store = {self.pipeline._kv_cache_memory_id("clean", cid) for cid in history_chunk_ids}
         if self.ref_image_kv_prefilled:

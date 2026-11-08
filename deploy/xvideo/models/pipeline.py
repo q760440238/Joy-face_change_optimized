@@ -7,7 +7,12 @@ from transformers import Qwen2Tokenizer, Qwen2_5_VLForConditionalGeneration, Aut
 from diffusers.models import AutoencoderKL
 from diffusers.schedulers import KarrasDiffusionSchedulers
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
-from xvideo.models.dit import Transformer3DModel, SELF_ATTN_MODE_REF_IMAGE_CACHE
+from xvideo.models.dit import (
+    Transformer3DModel,
+    SELF_ATTN_MODE_REF_IMAGE_CACHE,
+    begin_text_kv_capture,
+    end_text_kv_capture,
+)
 
 PRECISION_TO_TYPE = {
     'fp32': torch.float32,
@@ -380,6 +385,45 @@ class Pipeline(DiffusionPipeline):
                 temporal_ids.append(torch.arange(offset, offset + chunk_len, device=device, dtype=torch.long))
                 offset += chunk_len
             return torch.cat(temporal_ids, dim=0)
+
+    def _prefill_text_kv_cache(
+        self,
+        model,
+        *,
+        prompt_embeds: torch.Tensor,
+        anchor_latents: torch.Tensor,
+        transformer_dtype: torch.dtype,
+        timestep: float = 0.0,
+    ) -> Dict[int, Tuple[torch.Tensor, torch.Tensor]]:
+        """Run one text-on forward and capture every block's text K/V.
+
+        The captured tensors are the post qk-norm `txt_k` and the matching
+        `txt_v`, i.e. exactly what the live path appends after the image tokens.
+        They depend on the prompt (fixed for a session) and on this step's
+        timestep conditioning, which is why the caller keeps one cache per
+        denoise step. `anchor_latents` only sets the image context the text
+        tokens attend to during capture.
+        """
+        model_device = next(model.parameters()).device
+        anchor = anchor_latents.to(device=model_device, dtype=transformer_dtype)
+        step_timestep = torch.full(
+            (anchor.shape[0],), float(timestep),
+            device=anchor.device, dtype=transformer_dtype,
+        )
+        begin_text_kv_capture()
+        try:
+            with model.cache_context("cond"):
+                model(
+                    hidden_states=anchor,
+                    timestep=step_timestep,
+                    encoder_hidden_states=prompt_embeds,
+                    kv_cache_mode=None,
+                )
+        finally:
+            captured = end_text_kv_capture()
+        if not captured:
+            raise RuntimeError("text-stream K/V capture returned nothing")
+        return captured
 
     def _prefill_static_reference_kv_cache(
         self,

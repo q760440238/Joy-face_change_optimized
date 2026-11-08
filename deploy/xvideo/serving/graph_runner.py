@@ -7,8 +7,10 @@ from typing import Any, Callable, Optional
 import torch
 
 from xvideo.models.dit.rope import apply_rotary_emb
+from xvideo.models.dit import set_text_kv_active
 
 GRAPH_ENV = "JOYOMNI_CUDA_GRAPH"
+TEXT_KV_ENV = "JOYOMNI_TEXT_KV"
 
 # The captured graph's KV pool is laid out as exactly [sink, prev1(, ref)]:
 # an eager window [0, k-1, k] of this length is the only shape it can serve.
@@ -17,6 +19,10 @@ GRAPH_WINDOW_CHUNKS = 3
 
 def graph_env_enabled() -> bool:
     return os.environ.get(GRAPH_ENV, "1").lower() in {"1", "true", "yes", "on"}
+
+
+def text_kv_env_enabled() -> bool:
+    return os.environ.get(TEXT_KV_ENV, "0").lower() in {"1", "true", "yes", "on"}
 
 
 class StreamingGraphRunner:
@@ -28,6 +34,7 @@ class StreamingGraphRunner:
         ref_tokens: int,
         latent_shape: tuple[int, ...],
         txt_len: int,
+        text_kv_by_step: Optional[list[dict[int, tuple[torch.Tensor, torch.Tensor]]]] = None,
         max_temporal_ids: int,
         pos_freqs: tuple[torch.Tensor, torch.Tensor],
         device: torch.device,
@@ -45,6 +52,19 @@ class StreamingGraphRunner:
         self.chunk_tokens = chunk_tokens
         self.ref_tokens = int(ref_tokens)
         self.txt_len = int(txt_len)
+        # Static per-step text K/V buffers: the concatenation shape is baked into
+        # the graph, the values are refreshed by bind_session() per session.
+        self.text_kv_by_step: list[dict[int, tuple[torch.Tensor, torch.Tensor]]] = [
+            {
+                layer_idx: (
+                    torch.zeros_like(key, device=device, dtype=dtype),
+                    torch.zeros_like(value, device=device, dtype=dtype),
+                )
+                for layer_idx, (key, value) in cache.items()
+            }
+            for cache in (text_kv_by_step or ())
+        ]
+        self.text_kv_enabled = bool(self.text_kv_by_step)
         self.max_temporal_ids = int(max_temporal_ids)
         self.sink_off = 0
         self.prev1_off = chunk_tokens
@@ -115,6 +135,7 @@ class StreamingGraphRunner:
                         kv_cache_chunk_id=None,
                         kv_cache_selected_chunk_ids=[],
                         kv_cache_pre_rope=True,
+                        skip_text_stream=self.text_kv_enabled,
                     )[0]
 
         def run_store():
@@ -148,14 +169,19 @@ class StreamingGraphRunner:
             lat32 = self.in_noise.to(torch.float32)
             tf._graph_kv_assembler = self._pool_assembler
             tf._graph_kv_writer = None
-            for t_val, dt in zip(ts_vals, dt_vals):
+            for step_i, (t_val, dt) in enumerate(zip(ts_vals, dt_vals)):
                 self.in_latent.copy_(lat32.to(self.dtype))
                 self.in_timestep.fill_(t_val)
+                set_text_kv_active(
+                    self.text_kv_by_step[step_i] if self.text_kv_enabled else None
+                )
                 pred = run_denoise()
                 lat32 = lat32 + pred.to(torch.float32) * dt
             self.in_store_latent.copy_(lat32.to(self.dtype))
             tf._graph_kv_assembler = None
             tf._graph_kv_writer = self._stage_writer
+            # The store pass skips the text stream and must not see the cache.
+            set_text_kv_active(None)
             try:
                 run_store()
             finally:
@@ -173,6 +199,7 @@ class StreamingGraphRunner:
         finally:
             tf._graph_kv_assembler = None
             tf._graph_kv_writer = None
+            set_text_kv_active(None)
 
         torch.cuda.synchronize(self.device)
         self.ready = True
@@ -182,8 +209,20 @@ class StreamingGraphRunner:
               f"(static bufs {static_gib:.2f} GiB, txt_len={self.txt_len}, "
               f"ref_tokens={self.ref_tokens}, mti={self.max_temporal_ids})", flush=True)
 
-    def bind_session(self, token: int, prompt_embeds: torch.Tensor) -> None:
+    def bind_session(
+        self,
+        token: int,
+        prompt_embeds: torch.Tensor,
+        text_kv_by_step: Optional[list[dict[int, tuple[torch.Tensor, torch.Tensor]]]] = None,
+    ) -> None:
         self.in_prompt.copy_(prompt_embeds.to(dtype=self.dtype))
+        for dst_cache, src_cache in zip(self.text_kv_by_step, text_kv_by_step or ()):
+            for layer_idx, (key, value) in src_cache.items():
+                dst = dst_cache.get(layer_idx)
+                if dst is None:
+                    continue
+                dst[0].copy_(key.to(device=self.device, dtype=self.dtype))
+                dst[1].copy_(value.to(device=self.device, dtype=self.dtype))
         self.bound_token = token
         self.pool_dirty = True
         self.last_graph_chunk = -(10 ** 9)
