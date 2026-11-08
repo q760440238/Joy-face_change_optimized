@@ -7,6 +7,7 @@ from typing import Any, Callable, Optional
 import torch
 
 from xvideo.models.dit.rope import apply_rotary_emb
+from xvideo.lowvram import tight_vram_enabled
 from xvideo.models.dit import set_text_kv_active
 
 GRAPH_ENV = "JOYOMNI_CUDA_GRAPH"
@@ -18,6 +19,9 @@ GRAPH_WINDOW_CHUNKS = 3
 
 
 def graph_env_enabled() -> bool:
+    if tight_vram_enabled():
+        # The captured graph's static buffers cost ~2.4 GiB for ~7% latency.
+        return False
     return os.environ.get(GRAPH_ENV, "1").lower() in {"1", "true", "yes", "on"}
 
 

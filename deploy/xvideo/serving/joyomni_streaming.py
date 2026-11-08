@@ -16,7 +16,7 @@ from PIL import Image
 
 from xvideo.config import ExpConfig, generate_video_image_bucket
 from xvideo.models.models import load_dit, load_pipeline, build_vae
-from xvideo.lowvram import text_offload_enabled
+from xvideo.lowvram import text_offload_enabled, tight_vram_enabled
 from xvideo.models.dit import move_text_stream, set_text_kv_active, text_stream_bytes
 from xvideo.models.pipeline import (
     PRECISION_TO_TYPE,
@@ -750,6 +750,9 @@ class JoyOmniV2VStreamingSession:
         tf = self.pipeline.transformer
         if not getattr(tf, "_text_stream_offloaded", False) or self.device_type != "cuda":
             return False
+        if tight_vram_enabled():
+            # Staging the stream needs 7.5 GiB of headroom; page it instead.
+            return False
         need = text_stream_bytes(tf)
         free_b, _total_b = torch.cuda.mem_get_info(self.device)
         if free_b <= need + 2 * 2**30:
@@ -1340,6 +1343,9 @@ class JoyOmniV2VStreamingSession:
         if frozen_anchor_id is not None:
             keep_after_store.add(self.pipeline._kv_cache_memory_id("clean", frozen_anchor_id))
         self.pipeline.transformer.evict_kv_cache_chunks(keep_after_store)
+        if tight_vram_enabled():
+            # Hand the VAE transients back to the driver before the next chunk.
+            torch.cuda.empty_cache()
 
     def _finish_chunk_profile(
         self,

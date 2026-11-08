@@ -54,6 +54,11 @@ def text_offload_enabled() -> bool:
     return _env("JOYOMNI_TEXT_OFFLOAD") in _TRUTHY
 
 
+def tight_vram_enabled() -> bool:
+    """Trade latency for footprint: no CUDA graph, allocator released per chunk."""
+    return _env("JOYOMNI_TIGHT_VRAM") in _TRUTHY
+
+
 def apply_vram_cap_for_testing(device: torch.device | str | int | None = None) -> None:
     """Clamp the CUDA caching allocator to JOYOMNI_VRAM_CAP_GB (testing hook).
 
