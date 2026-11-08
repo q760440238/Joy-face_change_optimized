@@ -798,12 +798,16 @@ class JoyOmniV2VStreamingSession:
             ]
 
         dit_bytes = _bytes(_on_device(tf))
-        seen, vae_bytes = set(), 0
+        # decode/pseudo VAEs are distinct modules sharing the same tensors.
+        seen_vae_tensors, vae_bytes = set(), 0
         for vae in (self.pipeline.vae, self.decode_vae, self.pseudo_encode_vae):
-            if vae is None or id(vae) in seen:
+            if vae is None:
                 continue
-            seen.add(id(vae))
-            vae_bytes += _bytes(_on_device(vae))
+            for tensor in _on_device(vae):
+                if id(tensor) in seen_vae_tensors:
+                    continue
+                seen_vae_tensors.add(id(tensor))
+                vae_bytes += tensor.numel() * tensor.element_size()
         text_kv_bytes = 0
         for cache in (self._text_kv_by_step or ()):
             for key, value in cache.values():
