@@ -57,11 +57,12 @@ PyTorch 回退与 CUDA 版**逐张量验证一致**：99.997% 元素完全相同
 |---|---:|---:|---:|
 | 基线 | 25.5 GiB（26124 MiB） | 1.8 s | 0.314 s |
 | + 文本 K/V + 权重卸载 | 19.5 GiB（19926 MiB） | 6.4 s | 0.280 s |
-| + tight（关 graph） | **15.3 GiB**（15668 MiB） | 10.7 s | 0.314 s |
+| + tight（关 graph） | **15.3 GiB**（15668 MiB） | 10.7 s（首次 prompt）/ **1.4 s**（缓存命中） | 0.314 s |
 | + tight + `JOYOMNI_KV_DTYPE=int8` | **14.7 GiB** | 10.7 s | 0.316 s |
 
 > 注意：文本 K/V 缓存**本身不省显存**——启动时 24.8 GiB vs 基线 23.6 GiB（缓存 0.46 + graph 池 0.46），
 > 必须和 `JOYOMNI_TEXT_OFFLOAD` 一起用。表中数字为"跑完一个会话"后的 nvidia-smi，括号内为原始 MiB。
+> 文本 K/V 抓取的结果按（prompt embeds + 参考图 latent + steps + seed）做主机侧缓存（LRU 2），同一组输入的新会话直接拷回显存：首帧 **11.1 → 1.4 s**，逐帧与首次抓取 **138.13 dB** 完全一致（不同 prompt 各自 8–11 s 首次抓取，LRU 满时淘汰最旧一条）。
 
 - **16 GB 卡可跑**：`JOYOMNI_VRAM_CAP_GB=16` 的硬上限下 17 帧会话跑通（reserved 14.5 GiB，峰值 13.7 GiB）。
 - dit 每 chunk 0.219 → 0.185 s（graph 稳态，文本分支不再参与）。
