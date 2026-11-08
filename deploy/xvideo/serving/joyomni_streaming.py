@@ -215,6 +215,11 @@ class JoyOmniRuntime:
         self.ref_kv_cache: dict[str, dict] = {}
         self.ref_kv_order: list[str] = []
         self.ref_kv_cache_max = 2
+        # Host-side text K/V cache, keyed by everything the capture depends on
+        # (prompt embeds, reference latent, step count, seed).
+        self.text_kv_cache: dict[str, list] = {}
+        self.text_kv_order: list[str] = []
+        self.text_kv_cache_max = 2
         self.output_quality = 60
         self.lossless_output = False
         self.graph_runners: dict[tuple, StreamingGraphRunner] = {}
@@ -693,7 +698,7 @@ class JoyOmniV2VStreamingSession:
             self._prefill_or_reuse_reference_kv()
 
         if text_kv_env_enabled():
-            self._text_kv_by_step = self._capture_text_kv_by_step()
+            self._text_kv_by_step = self._text_kv_from_cache_or_capture()
 
         self._maybe_prepare_graph_runner()
         self._maybe_offload_text_stream()
@@ -760,6 +765,46 @@ class JoyOmniV2VStreamingSession:
                 f"{len(self.runtime.ref_kv_order)} reference(s))",
                 flush=True,
             )
+
+    def _text_kv_key(self) -> str:
+        """Hash the exact inputs of the text K/V capture."""
+        digest = hashlib.sha1()
+        embeds = self.streaming_cond_embeds.detach().to("cpu", torch.float32).contiguous()
+        digest.update(embeds.numpy().tobytes())
+        if self.ref_image_latent is None:
+            digest.update(b"no-reference")
+        else:
+            reference = self.ref_image_latent.detach().to("cpu", torch.float32).contiguous()
+            digest.update(reference.numpy().tobytes())
+        digest.update(f"{int(self.settings.num_inference_steps)}|{int(self.settings.seed)}".encode())
+        return digest.hexdigest()[:16]
+
+    def _text_kv_from_cache_or_capture(self) -> list[dict[int, tuple[torch.Tensor, torch.Tensor]]]:
+        key = self._text_kv_key()
+        cached = self.runtime.text_kv_cache.get(key)
+        if cached is not None:
+            caches = [
+                {layer: tuple(t.to(self.device) for t in pair) for layer, pair in step.items()}
+                for step in cached
+            ]
+            print(f"#####[TEXT-KV] reused host cache ({key})", flush=True)
+            return caches
+
+        started = time.perf_counter()
+        caches = self._capture_text_kv_by_step()
+        self.runtime.text_kv_cache[key] = [
+            {layer: tuple(t.to("cpu") for t in pair) for layer, pair in step.items()}
+            for step in caches
+        ]
+        self.runtime.text_kv_order.append(key)
+        while len(self.runtime.text_kv_order) > self.runtime.text_kv_cache_max:
+            self.runtime.text_kv_cache.pop(self.runtime.text_kv_order.pop(0), None)
+        print(
+            f"#####[TEXT-KV] cached on host ({key}, "
+            f"{len(self.runtime.text_kv_order)} entr(ies), {time.perf_counter() - started:.2f}s)",
+            flush=True,
+        )
+        return caches
 
     @torch.no_grad()
     def _capture_text_kv_by_step(self) -> list[dict[int, tuple[torch.Tensor, torch.Tensor]]]:
