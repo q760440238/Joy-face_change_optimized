@@ -236,7 +236,31 @@ def load_dit(cfg, device: torch.device) -> torch.nn.Module:
         logger.warning(f"Model has mixed dtypes: {param_dtypes}. Converting to {dtype}")
         model = model.to(dtype)
 
-    if low_vram:
+    stream_dit = low_vram and os.environ.get("JOYOMNI_STREAM_DIT", "").strip().lower() in {
+        "1", "true", "yes", "on"
+    }
+    if stream_dit:
+        # Keep every block in host RAM: quantise in place on CPU and let the
+        # forward page one block in at a time (~0.19 GiB resident instead of 7.8).
+        from xvideo.models.dit.dit import _fp8_stream_wanted, _maybe_install_fp8_stream
+
+        for name, child in model.named_children():
+            if name == "double_blocks":
+                continue
+            child.to(device_obj)
+        for block in model.double_blocks:
+            for stream_name in ("img", "txt"):
+                if _fp8_stream_wanted(stream_name):
+                    _maybe_install_fp8_stream(block, stream_name)
+        model._stream_blocks = True
+        model._text_stream_offloaded = True
+        model._text_stream_paged = True
+        torch.cuda.empty_cache()
+        logger.info(
+            "Streaming DiT: blocks stay in host RAM (JOYOMNI_STREAM_DIT=1); "
+            "one block is paged in per forward"
+        )
+    elif low_vram:
         model = _move_dit_to_device_lowvram(model, device_obj)
 
     from xvideo.models.dit.dit import install_fp8_head

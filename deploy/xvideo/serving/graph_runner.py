@@ -19,8 +19,10 @@ GRAPH_WINDOW_CHUNKS = 3
 
 
 def graph_env_enabled() -> bool:
-    if tight_vram_enabled():
-        # The captured graph's static buffers cost ~2.4 GiB for ~7% latency.
+    if tight_vram_enabled() or os.environ.get("JOYOMNI_STREAM_DIT", "").strip().lower() in {
+        "1", "true", "yes", "on"
+    }:
+        # Graph static buffers need the weights resident; streaming keeps them on host.
         return False
     return os.environ.get(GRAPH_ENV, "1").lower() in {"1", "true", "yes", "on"}
 

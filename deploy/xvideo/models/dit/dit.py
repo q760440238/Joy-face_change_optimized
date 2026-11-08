@@ -150,6 +150,21 @@ def set_text_kv_active(cache: dict | None) -> None:
 # (non-streaming) sample. The streaming server runs every denoise/store forward
 # with skip_text_stream=True, so once the K/V cache exists the weights can live
 # on the host and be paged back in one block at a time for the next capture.
+_IMG_STREAM_ATTRS = (
+    "img_mod",
+    "img_norm1",
+    "img_norm2",
+    "img_attn_q_norm",
+    "img_attn_k_norm",
+    "img_attn_qkv",
+    "img_attn_proj",
+    "img_mlp",
+    "_fp8_img_attn_qkv",
+    "_fp8_img_attn_proj",
+    "_fp8_img_mlp_up",
+    "_fp8_img_mlp_down",
+)
+
 _TEXT_STREAM_ATTRS = (
     "txt_mod",
     "txt_norm1",
@@ -197,9 +212,9 @@ def move_block_text_stream(block, device) -> int:
     return moved
 
 
-def _text_tensor_chains(block):
-    """Yield (attr_chain, is_param, tensor) for every leaf tensor of the text modules."""
-    for root in _TEXT_STREAM_ATTRS:
+def _stream_tensor_chains(block, attrs):
+    """Yield (attr_chain, is_param, tensor) for every leaf tensor of `attrs`."""
+    for root in attrs:
         module = getattr(block, root, None)
         if not isinstance(module, nn.Module):
             continue
@@ -210,6 +225,10 @@ def _text_tensor_chains(block):
                     if tensor is None:
                         continue
                     yield (root, *steps, name), is_param, tensor
+
+
+def _text_tensor_chains(block):
+    return _stream_tensor_chains(block, _TEXT_STREAM_ATTRS)
 
 
 def _resolve_chain(block, chain):
@@ -280,6 +299,56 @@ class _TextStreamPager:
         for slot, host in zip(self.slots, hosts):
             host.copy_(slot, non_blocking=True)
         self._bind(layer_idx, hosts)
+
+
+class _BlockPager:
+    """Page one image block in at a time; the host copy is authoritative.
+
+    Inference never writes the weights, so no page-out copy is needed - the next
+    page-in simply overwrites the slots.
+    """
+
+    def __init__(self, transformer, device: torch.device):
+        blocks = list(transformer.double_blocks)
+        template = list(_stream_tensor_chains(blocks[0], _IMG_STREAM_ATTRS))
+        self.device = device
+        self.blocks = blocks
+        self.specs = [(chain, is_param) for chain, is_param, _ in template]
+        self.slots = [
+            torch.empty_strided(tensor.size(), tensor.stride(), dtype=tensor.dtype, device=device)
+            for _, _, tensor in template
+        ]
+        self.hosts: list[list[torch.Tensor]] = []
+        for block in blocks:
+            hosts = []
+            for chain, is_param in self.specs:
+                obj, name = _resolve_chain(block, chain)
+                hosts.append((obj._parameters if is_param else obj._buffers)[name])
+            self.hosts.append(hosts)
+        self.bytes = sum(t.numel() * t.element_size() for t in self.slots)
+
+    def page_in(self, layer_idx: int) -> None:
+        hosts = self.hosts[layer_idx]
+        for slot, host in zip(self.slots, hosts):
+            slot.copy_(host, non_blocking=True)
+        block = self.blocks[layer_idx]
+        for (chain, is_param), slot in zip(self.specs, self.slots):
+            obj, name = _resolve_chain(block, chain)
+            _bind_tensor(obj, name, slot, is_param)
+
+
+def _ensure_block_pager(transformer, device) -> "_BlockPager":
+    pager = getattr(transformer, "_block_stream_pager", None)
+    if pager is None:
+        started = time.time()
+        pager = _BlockPager(transformer, device)
+        transformer._block_stream_pager = pager
+        print(
+            f"#####[BLOCK-PAGER] {pager.bytes / 2**20:.0f} MiB of GPU slots for "
+            f"{len(pager.blocks)} blocks, built in {time.time() - started:.2f}s",
+            flush=True,
+        )
+    return pager
 
 
 def _ensure_text_pager(transformer, device) -> "_TextStreamPager":
@@ -1329,7 +1398,12 @@ class Transformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                 "text K/V cache, or set transformer._text_stream_paged=True to page it in"
             )
         _text_pager = _ensure_text_pager(self, device) if _text_paged else None
+        _block_pager = (
+            _ensure_block_pager(self, device) if getattr(self, "_stream_blocks", False) else None
+        )
         for layer_idx, block in enumerate(self.double_blocks):
+            if _block_pager is not None:
+                _block_pager.page_in(layer_idx)
             if _text_pager is not None:
                 _text_pager.page_in(layer_idx)
             img, txt = block(
