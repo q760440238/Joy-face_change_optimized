@@ -196,7 +196,7 @@ def move_block_text_stream(block, device) -> int:
     return moved
 
 
-def move_text_stream(transformer, device) -> int:
+def move_text_stream(transformer, device, pin: bool = True) -> int:
     """Move the whole text stream to `device` (host RAM by default).
 
     Off-loading also pins the host copy so the per-block page-in during the next
@@ -207,7 +207,7 @@ def move_text_stream(transformer, device) -> int:
     for block in transformer.double_blocks:
         moved += move_block_text_stream(block, device)
     transformer._text_stream_offloaded = device.type != "cuda"
-    if device.type == "cpu":
+    if device.type == "cpu" and pin:
         for block in transformer.double_blocks:
             for module in _text_stream_modules(block):
                 for tensor in _module_tensors(module):

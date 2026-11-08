@@ -17,7 +17,7 @@ from PIL import Image
 from xvideo.config import ExpConfig, generate_video_image_bucket
 from xvideo.models.models import load_dit, load_pipeline, build_vae
 from xvideo.lowvram import text_offload_enabled
-from xvideo.models.dit import move_text_stream, set_text_kv_active
+from xvideo.models.dit import move_text_stream, set_text_kv_active, text_stream_bytes
 from xvideo.models.pipeline import (
     PRECISION_TO_TYPE,
 )
@@ -712,16 +712,20 @@ class JoyOmniV2VStreamingSession:
             )
         self.pipeline.scheduler.set_timesteps(self.settings.num_inference_steps, device=self.device)
         started = time.perf_counter()
-        caches = [
-            self.pipeline._prefill_text_kv_cache(
-                self.pipeline.transformer,
-                prompt_embeds=self.streaming_cond_embeds,
-                anchor_latents=anchor,
-                transformer_dtype=self.target_dtype,
-                timestep=float(timestep),
-            )
-            for timestep in self.pipeline.scheduler.timesteps
-        ]
+        staged = self._stage_text_stream_for_capture()
+        try:
+            caches = [
+                self.pipeline._prefill_text_kv_cache(
+                    self.pipeline.transformer,
+                    prompt_embeds=self.streaming_cond_embeds,
+                    anchor_latents=anchor,
+                    transformer_dtype=self.target_dtype,
+                    timestep=float(timestep),
+                )
+                for timestep in self.pipeline.scheduler.timesteps
+            ]
+        finally:
+            self._unstage_text_stream(staged)
         layers = len(caches[0]) if caches else 0
         gib = sum(
             tensor.numel() * tensor.element_size()
@@ -735,6 +739,42 @@ class JoyOmniV2VStreamingSession:
             flush=True,
         )
         return caches
+
+    def _stage_text_stream_for_capture(self) -> bool:
+        """Move the whole text stream onto the device when it comfortably fits.
+
+        Returns True when the stream was staged (caller must unstage); False
+        leaves the per-block paging path in place for tight-VRAM cards.
+        """
+        tf = self.pipeline.transformer
+        if not getattr(tf, "_text_stream_offloaded", False) or self.device_type != "cuda":
+            return False
+        need = text_stream_bytes(tf)
+        free_b, _total_b = torch.cuda.mem_get_info(self.device)
+        if free_b <= need + 2 * 2**30:
+            return False
+        started = time.perf_counter()
+        moved = move_text_stream(tf, self.device)
+        tf._text_stream_paged = False
+        print(
+            f"#####[TEXT-KV] staged {moved / 2**30:.2f} GiB text weights on device for capture "
+            f"({time.perf_counter() - started:.2f}s)",
+            flush=True,
+        )
+        return True
+
+    def _unstage_text_stream(self, staged: bool) -> None:
+        if not staged:
+            return
+        tf = self.pipeline.transformer
+        started = time.perf_counter()
+        move_text_stream(tf, "cpu", pin=False)
+        tf._text_stream_paged = True
+        torch.cuda.empty_cache()
+        print(
+            f"#####[TEXT-KV] text weights parked back on host ({time.perf_counter() - started:.2f}s)",
+            flush=True,
+        )
 
     def _maybe_offload_text_stream(self) -> None:
         """Park the text-stream weights in host RAM once their K/V is cached.
