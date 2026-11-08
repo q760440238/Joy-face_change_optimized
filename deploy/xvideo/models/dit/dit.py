@@ -300,6 +300,14 @@ class _TextStreamPager:
         self._bind(layer_idx, self.hosts[layer_idx])
 
 
+_STREAM_PREFETCH_ENV = "JOYOMNI_STREAM_PREFETCH"
+
+
+def stream_prefetch_enabled() -> bool:
+    """Double-buffer the streamed blocks (experimental, see the commit message)."""
+    return os.environ.get(_STREAM_PREFETCH_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 class _BlockPager:
     """Page one image block in at a time; the host copy is authoritative.
 
@@ -341,6 +349,50 @@ class _BlockPager:
         self._bound_once = True
         self.pinned_tensors = pinned
         self.bytes = sum(t.numel() * t.element_size() for t in self.slots)
+        self.prefetch_enabled = stream_prefetch_enabled()
+        if self.prefetch_enabled:
+            self._buffers = [self.slots, self._alloc_buffer()]
+            self._copy_stream = torch.cuda.Stream(device=device)
+            self._ready = [torch.cuda.Event(), torch.cuda.Event()]
+            self._free: list[torch.cuda.Event | None] = [None, None]
+            self._buffer = 0
+            self.bytes *= 2
+        else:
+            self._buffers = [self.slots]
+            self._buffer = 0
+
+    def _alloc_buffer(self) -> list[torch.Tensor]:
+        return [
+            torch.empty_strided(t.size(), t.stride(), dtype=t.dtype, device=self.device)
+            for t in self.slots
+        ]
+
+    def prefetch(self, layer_idx: int) -> None:
+        """Start copying `layer_idx` into the idle buffer on the copy stream."""
+        buf = 1 - self._buffer
+        wait = self._free[buf]
+        if wait is not None:
+            self._copy_stream.wait_event(wait)
+        with torch.cuda.stream(self._copy_stream):
+            for slot, host in zip(self._buffers[buf], self.hosts[layer_idx]):
+                slot.copy_(host, non_blocking=True)
+            self._ready[buf].record(self._copy_stream)
+
+    def use(self, layer_idx: int) -> None:
+        """Wait for the prefetched buffer and bind the block to it."""
+        buf = 1 - self._buffer
+        torch.cuda.current_stream().wait_event(self._ready[buf])
+        block = self.blocks[layer_idx]
+        for (chain, is_param), slot in zip(self.specs, self._buffers[buf]):
+            obj, name = _resolve_chain(block, chain)
+            _bind_tensor(obj, name, slot, is_param)
+        self._buffer = buf
+
+    def release(self) -> None:
+        """Mark the buffer currently in use free once the enqueued work drains."""
+        event = torch.cuda.Event()
+        event.record(torch.cuda.current_stream())
+        self._free[self._buffer] = event
 
     def page_in(self, layer_idx: int) -> None:
         for slot, host in zip(self.slots, self.hosts[layer_idx]):
@@ -1413,7 +1465,15 @@ class Transformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         )
         for layer_idx, block in enumerate(self.double_blocks):
             if _block_pager is not None:
-                _block_pager.page_in(layer_idx)
+                if _block_pager.prefetch_enabled:
+                    if layer_idx == 0:
+                        _block_pager.prefetch(0)
+                    else:
+                        _block_pager.release()
+                        _block_pager.prefetch(layer_idx)
+                    _block_pager.use(layer_idx)
+                else:
+                    _block_pager.page_in(layer_idx)
             if _text_pager is not None:
                 _text_pager.page_in(layer_idx)
             img, txt = block(
@@ -1434,6 +1494,8 @@ class Transformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
             )
             if _text_pager is not None:
                 _text_pager.page_out(layer_idx)
+        if _block_pager is not None and _block_pager.prefetch_enabled:
+            _block_pager.release()
 
         img = self.proj_out(self.norm_out(img))
 
