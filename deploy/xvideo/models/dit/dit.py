@@ -303,6 +303,41 @@ def attention_backend() -> str:
     return "SDPA (cuDNN/flash)"
 
 
+_FP8_HEAD_ENV = "JOYOMNI_FP8_HEAD"
+
+
+def install_fp8_head(transformer) -> int:
+    """Quantise the head/embedding Linears to FP8 (JOYOMNI_FP8_HEAD=1).
+
+    Covers `proj_out` and all of `condition_embedder` (time_proj, time_embedder,
+    text_embedder: 152 M params). `img_in` keeps its 5-D weight and stays bf16.
+    """
+    if os.environ.get(_FP8_HEAD_ENV, "").strip().lower() not in {"1", "true", "yes", "on"}:
+        return 0
+    if getattr(transformer, "_fp8_head_installed", False):
+        return 0
+    from xvideo.models.dit.fp8_linear import Fp8Linear
+
+    embedder = transformer.condition_embedder
+    targets = (
+        (transformer, "proj_out"),
+        (embedder, "time_proj"),
+        (embedder.time_embedder, "linear_1"),
+        (embedder.time_embedder, "linear_2"),
+        (embedder.text_embedder, "linear_1"),
+        (embedder.text_embedder, "linear_2"),
+    )
+    moved = 0
+    for module, name in targets:
+        linear = getattr(module, name, None)
+        if not isinstance(linear, nn.Linear):
+            continue
+        moved += sum(p.numel() * p.element_size() for p in linear.parameters())
+        setattr(module, name, Fp8Linear.from_linear(linear))
+    transformer._fp8_head_installed = True
+    return moved
+
+
 _KV_DTYPE_ENV = "JOYOMNI_KV_DTYPE"
 _KV_FP8_ENV = "JOYOMNI_KV_FP8"
 _KV_FP8_MAX = 448.0

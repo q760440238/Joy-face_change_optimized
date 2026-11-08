@@ -6,6 +6,7 @@ from xvideo.models.dit.dit import (
     end_text_kv_capture,
     set_text_kv_active,
     move_text_stream,
+    install_fp8_head,
     kv_entry_from_tensors,
     kv_entry_tensors,
     kv_cache_dtype,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import queue
 import threading
@@ -209,6 +210,11 @@ class JoyOmniRuntime:
         self.pseudo_encode_vae = pseudo_encode_vae or self.decode_vae
         self.postprocess_device = postprocess_device or _module_device(self.pseudo_encode_vae)
         self.dit_lock = threading.Lock()
+        # Host-side reference-image K/V cache: one entry per distinct reference,
+        # so a session that reuses the same reference skips the 40-block prefill.
+        self.ref_kv_cache: dict[str, dict] = {}
+        self.ref_kv_order: list[str] = []
+        self.ref_kv_cache_max = 2
         self.output_quality = 60
         self.lossless_output = False
         self.graph_runners: dict[tuple, StreamingGraphRunner] = {}
@@ -684,13 +690,7 @@ class JoyOmniV2VStreamingSession:
         self._clear_vae_feature_caches()
         self.pipeline.transformer.reset_inference_kv_cache()
         if self.ref_image_latent is not None:
-            self.pipeline._prefill_static_reference_kv_cache(
-                self.pipeline.transformer,
-                prompt_embeds=self.streaming_cond_embeds,
-                reference_image_latents=self.ref_image_latent,
-                transformer_dtype=self.target_dtype,
-            )
-            self.ref_image_kv_prefilled = True
+            self._prefill_or_reuse_reference_kv()
 
         if text_kv_env_enabled():
             self._text_kv_by_step = self._capture_text_kv_by_step()
@@ -700,6 +700,66 @@ class JoyOmniV2VStreamingSession:
         self._log_memory_breakdown("init")
 
         self.initialized = True
+
+    def _reference_kv_key(self) -> str:
+        latent = self.ref_image_latent.detach().to("cpu", torch.float32).contiguous()
+        return hashlib.sha1(latent.numpy().tobytes()).hexdigest()[:16]
+
+    @staticmethod
+    def _kv_entry_to(entry: dict, device) -> dict:
+        out = {"pre_rope": bool(entry.get("pre_rope", False))}
+        for name, tensor in entry.items():
+            if isinstance(tensor, torch.Tensor):
+                out[name] = tensor.to(device=device)
+            elif name != "pre_rope":
+                out[name] = tensor
+        return out
+
+    def _prefill_or_reuse_reference_kv(self) -> None:
+        """Prefill the reference-image K/V once per reference image.
+
+        The prefill runs with `skip_text_stream=True`, so its K/V depends only on
+        the reference latent; a host-side copy can be installed on a later
+        session with the same reference image.
+        """
+        key = self._reference_kv_key()
+        tf = self.pipeline.transformer
+        ref_id = self.pipeline._kv_cache_memory_id("ref_image")
+        cached = self.runtime.ref_kv_cache.get(key)
+        if cached is not None:
+            scope_store = tf._inference_kv_cache.setdefault("cond", {})
+            scope_store[ref_id] = {
+                layer_idx: self._kv_entry_to(entry, self.device)
+                for layer_idx, entry in cached.items()
+            }
+            tf._kv_cache_generation += 1
+            self.ref_image_kv_prefilled = True
+            print(f"#####[REF-KV] reused reference K/V from host cache ({key})", flush=True)
+            return
+
+        self.pipeline._prefill_static_reference_kv_cache(
+            self.pipeline.transformer,
+            prompt_embeds=self.streaming_cond_embeds,
+            reference_image_latents=self.ref_image_latent,
+            transformer_dtype=self.target_dtype,
+        )
+        self.ref_image_kv_prefilled = True
+
+        scope_store = tf._inference_kv_cache.get("cond", {})
+        store = scope_store.get(ref_id)
+        if store:
+            self.runtime.ref_kv_cache[key] = {
+                layer_idx: self._kv_entry_to(entry, "cpu")
+                for layer_idx, entry in store.items()
+            }
+            self.runtime.ref_kv_order.append(key)
+            while len(self.runtime.ref_kv_order) > self.runtime.ref_kv_cache_max:
+                self.runtime.ref_kv_cache.pop(self.runtime.ref_kv_order.pop(0), None)
+            print(
+                f"#####[REF-KV] cached reference K/V on host ({key}, "
+                f"{len(self.runtime.ref_kv_order)} reference(s))",
+                flush=True,
+            )
 
     @torch.no_grad()
     def _capture_text_kv_by_step(self) -> list[dict[int, tuple[torch.Tensor, torch.Tensor]]]:

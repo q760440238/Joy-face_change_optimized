@@ -239,6 +239,13 @@ def load_dit(cfg, device: torch.device) -> torch.nn.Module:
     if low_vram:
         model = _move_dit_to_device_lowvram(model, device_obj)
 
+    from xvideo.models.dit.dit import install_fp8_head
+    head_bytes = install_fp8_head(model)
+    if head_bytes:
+        logger.info(
+            f"FP8 head: {head_bytes / 2**20:.0f} MiB of head/embedding weights quantised"
+        )
+
     return model.eval()
 
 
