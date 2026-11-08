@@ -144,6 +144,85 @@ def set_text_kv_active(cache: dict | None) -> None:
     _TEXT_KV_ACTIVE = cache
 
 
+# --- text-stream offload (keep the txt weights in host RAM) -----------------
+# Only a text-on forward touches these: the per-session K/V capture and a full
+# (non-streaming) sample. The streaming server runs every denoise/store forward
+# with skip_text_stream=True, so once the K/V cache exists the weights can live
+# on the host and be paged back in one block at a time for the next capture.
+_TEXT_STREAM_ATTRS = (
+    "txt_mod",
+    "txt_norm1",
+    "txt_norm2",
+    "txt_attn_q_norm",
+    "txt_attn_k_norm",
+    "txt_attn_qkv",
+    "txt_attn_proj",
+    "txt_mlp",
+    "_fp8_txt_attn_qkv",
+    "_fp8_txt_attn_proj",
+    "_fp8_txt_mlp_up",
+    "_fp8_txt_mlp_down",
+)
+
+
+def _text_stream_modules(block):
+    for name in _TEXT_STREAM_ATTRS:
+        module = getattr(block, name, None)
+        if isinstance(module, nn.Module):
+            yield module
+
+
+def _module_tensors(module):
+    return list(module.parameters()) + list(module.buffers())
+
+
+def text_stream_bytes(transformer) -> int:
+    """Bytes held by every block's text-stream weights."""
+    return sum(
+        tensor.numel() * tensor.element_size()
+        for block in transformer.double_blocks
+        for module in _text_stream_modules(block)
+        for tensor in _module_tensors(module)
+    )
+
+
+def move_block_text_stream(block, device) -> int:
+    """Move one block's text-stream weights to `device`; returns bytes moved."""
+    moved = 0
+    for module in _text_stream_modules(block):
+        for tensor in _module_tensors(module):
+            moved += tensor.numel() * tensor.element_size()
+        module.to(device)
+    return moved
+
+
+def move_text_stream(transformer, device) -> int:
+    """Move the whole text stream to `device` (host RAM by default).
+
+    Off-loading also pins the host copy so the per-block page-in during the next
+    K/V capture runs at PCIe speed instead of pageable-RAM speed.
+    """
+    device = torch.device(device)
+    moved = 0
+    for block in transformer.double_blocks:
+        moved += move_block_text_stream(block, device)
+    transformer._text_stream_offloaded = device.type != "cuda"
+    if device.type == "cpu":
+        for block in transformer.double_blocks:
+            for module in _text_stream_modules(block):
+                for tensor in _module_tensors(module):
+                    if tensor.is_pinned() or not tensor.is_floating_point():
+                        continue
+                    try:
+                        pinned = tensor.data.pin_memory()
+                    except Exception:  # noqa: BLE001 - pinnable memory is best effort
+                        break
+                    if pinned.stride() != tensor.stride():
+                        continue
+                    tensor.data = pinned
+    return moved
+
+
 from xvideo.models.dit.rope import apply_rotary_emb, get_1d_rotary_pos_embed
 
 
@@ -678,6 +757,10 @@ class Transformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
             self._kv_assembly_cache = {}
         if not hasattr(self, "_kv_assembly_freqs"):
             self._kv_assembly_freqs = None
+        if not hasattr(self, "_text_stream_offloaded"):
+            self._text_stream_offloaded = False
+        if not hasattr(self, "_text_stream_paged"):
+            self._text_stream_paged = False
 
     def reset_inference_kv_cache(self) -> None:
         self._ensure_kv_cache_state()
@@ -1020,7 +1103,19 @@ class Transformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
 
         _graph_assembler = getattr(self, "_graph_kv_assembler", None)
         _graph_writer = getattr(self, "_graph_kv_writer", None)
+        _text_paged = (
+            self._text_stream_offloaded
+            and self._text_stream_paged
+            and not skip_text_stream
+        )
+        if self._text_stream_offloaded and not skip_text_stream and not _text_paged:
+            raise RuntimeError(
+                "text stream is offloaded to host: run with skip_text_stream=True and a "
+                "text K/V cache, or set transformer._text_stream_paged=True to page it in"
+            )
         for layer_idx, block in enumerate(self.double_blocks):
+            if _text_paged:
+                move_block_text_stream(block, device)
             img, txt = block(
                 img,
                 txt,
@@ -1037,6 +1132,8 @@ class Transformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                 kv_cache_pre_rope=kv_cache_pre_rope,
                 cached_freqs_cis=cached_freqs_cis,
             )
+            if _text_paged:
+                move_block_text_stream(block, "cpu")
 
         img = self.proj_out(self.norm_out(img))
 

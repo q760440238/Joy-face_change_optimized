@@ -109,7 +109,12 @@ def _move_dit_to_device_lowvram(model: torch.nn.Module, device: torch.device) ->
     resident on the GPU (peak ~= FP8 footprint + one bf16 block)."""
     import time
 
-    from xvideo.models.dit.dit import _fp8_stream_wanted, _maybe_install_fp8_stream
+    from xvideo.models.dit.dit import (
+        _fp8_stream_wanted,
+        _maybe_install_fp8_stream,
+        move_block_text_stream,
+    )
+    from xvideo.lowvram import text_offload_enabled
 
     fp8_streams = [s for s in ("img", "txt") if _fp8_stream_wanted(s)]
     if len(fp8_streams) < 2:
@@ -127,15 +132,28 @@ def _move_dit_to_device_lowvram(model: torch.nn.Module, device: torch.device) ->
 
     started = time.time()
     num_blocks = len(model.double_blocks)
+    offload_text = text_offload_enabled() and "txt" in fp8_streams
+    text_bytes = 0
     for i, block in enumerate(model.double_blocks):
         block.to(device)
         for stream in fp8_streams:
             _maybe_install_fp8_stream(block, stream)
+        if offload_text:
+            # Park the text-stream weights in host RAM as each block lands: the
+            # text branch is only needed for the per-session K/V capture, which
+            # pages one block back in at a time.
+            text_bytes += move_block_text_stream(block, "cpu")
         if (i + 1) % 10 == 0 or i + 1 == num_blocks:
             logger.info(
                 f"Low-VRAM DiT load: {i + 1}/{num_blocks} blocks staged to {device} "
                 f"({time.time() - started:.1f}s)"
             )
+    if offload_text:
+        model._text_stream_offloaded = True
+        model._text_stream_paged = True
+        logger.info(
+            f"Low-VRAM DiT load: {text_bytes / 2**30:.2f} GiB text-stream weights kept in host RAM"
+        )
     if device.type == "cuda":
         torch.cuda.empty_cache()
         free_b, total_b = torch.cuda.mem_get_info(device)

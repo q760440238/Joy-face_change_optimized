@@ -49,6 +49,11 @@ def te_pin_memory_enabled() -> bool:
     return _env("JOYOMNI_TE_PIN", "1") in _TRUTHY
 
 
+def text_offload_enabled() -> bool:
+    """Keep the DiT text-stream weights in host RAM (needs a text K/V cache)."""
+    return _env("JOYOMNI_TEXT_OFFLOAD") in _TRUTHY
+
+
 def apply_vram_cap_for_testing(device: torch.device | str | int | None = None) -> None:
     """Clamp the CUDA caching allocator to JOYOMNI_VRAM_CAP_GB (testing hook).
 

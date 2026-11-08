@@ -16,7 +16,8 @@ from PIL import Image
 
 from xvideo.config import ExpConfig, generate_video_image_bucket
 from xvideo.models.models import load_dit, load_pipeline, build_vae
-from xvideo.models.dit import set_text_kv_active
+from xvideo.lowvram import text_offload_enabled
+from xvideo.models.dit import move_text_stream, set_text_kv_active
 from xvideo.models.pipeline import (
     PRECISION_TO_TYPE,
 )
@@ -690,6 +691,7 @@ class JoyOmniV2VStreamingSession:
             self._text_kv_by_step = self._capture_text_kv_by_step()
 
         self._maybe_prepare_graph_runner()
+        self._maybe_offload_text_stream()
 
         self.initialized = True
 
@@ -733,6 +735,37 @@ class JoyOmniV2VStreamingSession:
             flush=True,
         )
         return caches
+
+    def _maybe_offload_text_stream(self) -> None:
+        """Park the text-stream weights in host RAM once their K/V is cached.
+
+        Every denoise/store forward from here on runs skip_text_stream=True, so
+        the only thing that still needs the weights is the next session's K/V
+        capture, which pages them in one block at a time.
+        """
+        if not text_offload_enabled():
+            return
+        if not self._text_kv_by_step:
+            print(
+                "#####[TEXT-OFFLOAD] skipped: no cached text K/V (set JOYOMNI_TEXT_KV=1)",
+                flush=True,
+            )
+            return
+        tf = self.pipeline.transformer
+        if getattr(tf, "_text_stream_offloaded", False):
+            return
+        if self.device_type != "cuda":
+            return
+        freed = move_text_stream(tf, "cpu")
+        tf._text_stream_paged = True
+        torch.cuda.empty_cache()
+        free_b, total_b = torch.cuda.mem_get_info(self.device)
+        print(
+            f"#####[TEXT-OFFLOAD] {freed / 2**30:.2f} GiB text-stream weights -> host RAM "
+            f"(paged per block for the next capture); device used "
+            f"{(total_b - free_b) / 2**30:.1f}/{total_b / 2**30:.1f} GiB",
+            flush=True,
+        )
 
     @torch.no_grad()
     def _encode_streaming_prompt(self, anchor_frame: Image.Image) -> None:
