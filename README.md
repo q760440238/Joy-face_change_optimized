@@ -67,12 +67,18 @@ PyTorch 回退与 CUDA 版**逐张量验证一致**：99.997% 元素完全相同
 - 可选 `JOYOMNI_KV_DTYPE=int8`：缓存的图像 K/V 存 int8（按 token/head 缩放），KV 1.44 → 0.74 GiB，稳态 15.3 → **14.7 GiB**；代价是与 bf16 缓存的输出差 **26.8 dB**（可复现测量），只在显存最紧时用。
 - 会话可复现：`seed_everything(seed)` 之后，同 prompt/seed 的连续两个会话逐帧一致（138 dB）；改动前因为参考图 VAE 采样走全局 RNG，两个会话相差约 25 dB。
 
-### 2. 其他方向
+### 2. 其他方向（本轮实测）
 
-- **MLP 5-bit**：注意力 int8 + MLP 5-bit 约 13.3 GiB，误差预计 0.35%，相似度有望到 0.27–0.29
-- **参考图 KV 复用**：同一张参考图跨会话复用，省一次 prefill
-- **VAE 分时驻留**：encode/decode 之间释放对方，省约 0.7 GB
-- **HEAD 输出量化**：`proj_out` 与 `img_in` 保持 bf16（已默认）
+- **参考图 KV 复用** ✅ 已实现：参考图 prefill 跑的是 `skip_text_stream=True`，K/V 只依赖参考图 latent。
+  现在在主机侧留一个 LRU（2 条），同一参考图的新会话直接 memcpy 回显存，省一次 40 个 block 的前向（≈0.4 s/会话），
+  数值完全一致（复用 vs 重算逐帧 138.13 dB）。
+- **VAE 分时驻留** ❌ 不适用：单卡部署里 encode / decode / pseudo-encode 三个角色共享同一份 VAE
+  （`_vae_for_role` 走 share 分支，`decode_vae = pipeline.vae`），全程只有 1.43 GiB 一份，没有"另一份"可释放。
+  原先说的省 0.7 GB 基于"两份 VAE"的假设，实测不成立；只有在 `--vae-decode-device` 指定第二张卡时才会出现第二份。
+- **HEAD 输出量化** ⚠️ 已实现但**不建议开**：`JOYOMNI_FP8_HEAD=1` 把 `proj_out` + `condition_embedder`
+  （time_proj / time_embedder / text_embedder，152 M，291 MiB bf16）转成 FP8，省 145 MiB；
+  但与 bf16 输出差 **23.2 dB**（可复现测量），与整模型 8-bit 量化的 21.8 dB 同量级 —— 调制向量太敏感。
+- **MLP 5-bit**：注意力 int8 + MLP 5-bit 约 13.3 GiB，误差预计 0.35%，相似度有望到 0.27–0.29（未做）
 
 ## 快速开始
 
