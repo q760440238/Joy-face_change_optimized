@@ -8,7 +8,7 @@ import torch
 
 from xvideo.models.dit.rope import apply_rotary_emb
 from xvideo.lowvram import tight_vram_enabled
-from xvideo.models.dit import set_text_kv_active
+from xvideo.models.dit import kv_entry_from_tensors, kv_entry_tensors, set_text_kv_active
 
 GRAPH_ENV = "JOYOMNI_CUDA_GRAPH"
 TEXT_KV_ENV = "JOYOMNI_TEXT_KV"
@@ -263,8 +263,7 @@ class StreamingGraphRunner:
                       freqs: Optional[tuple[torch.Tensor, torch.Tensor]]) -> None:
         for li in range(self.num_layers):
             entry = chunk_store[li]
-            k = entry["key"].to(device=self.device, dtype=self.dtype)
-            v = entry["value"].to(device=self.device, dtype=self.dtype)
+            k, v = kv_entry_tensors(entry, device=self.device, dtype=self.dtype)
             if entry.get("pre_rope", False):
                 if freqs is None:
                     raise RuntimeError("graph seed: pre-rope entry in a no-rope segment")
@@ -296,9 +295,7 @@ class StreamingGraphRunner:
         self.pub_v[p].copy_(self.stage_v)
         chunk_store = {}
         for li in range(self.num_layers):
-            chunk_store[li] = {
-                "key": self.pub_k[p, li],
-                "value": self.pub_v[p, li],
-                "pre_rope": True,
-            }
+            chunk_store[li] = kv_entry_from_tensors(
+                self.pub_k[p, li], self.pub_v[p, li], pre_rope=True
+            )
         scope_store[mem_id] = chunk_store

@@ -816,9 +816,8 @@ class JoyOmniV2VStreamingSession:
         scope_store = tf._inference_kv_cache.get(tf._kv_cache_scope or "cond", {})
         for chunk_store in scope_store.values():
             for entry in chunk_store.values():
-                for name in ("key", "value"):
-                    tensor = entry.get(name)
-                    if tensor is not None:
+                for tensor in entry.values():
+                    if isinstance(tensor, torch.Tensor):
                         kv_store_bytes += tensor.numel() * tensor.element_size()
         graph_bytes = sum(
             runner.static_bytes()

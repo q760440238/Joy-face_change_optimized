@@ -303,6 +303,68 @@ def attention_backend() -> str:
     return "SDPA (cuDNN/flash)"
 
 
+_KV_FP8_ENV = "JOYOMNI_KV_FP8"
+_KV_FP8_MAX = 448.0
+
+
+def kv_fp8_enabled() -> bool:
+    """Store cached image K/V as FP8 (e4m3) with a per token/head scale."""
+    return os.environ.get(_KV_FP8_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def kv_entry_from_tensors(
+    key: Optional[torch.Tensor],
+    value: Optional[torch.Tensor],
+    *,
+    pre_rope: bool,
+) -> Dict[str, object]:
+    """Build one cache entry, quantised to FP8 when JOYOMNI_KV_FP8 is on."""
+    entry: Dict[str, object] = {"pre_rope": bool(pre_rope)}
+    if key is None or value is None:
+        entry["key"] = None
+        entry["value"] = None
+        return entry
+    if not kv_fp8_enabled():
+        entry["key"] = _clone_kv_tensor(key)
+        entry["value"] = _clone_kv_tensor(value)
+        return entry
+    for name, tensor in (("key", key), ("value", value)):
+        tensor = tensor.detach()
+        scale = (
+            tensor.abs().amax(dim=-1, keepdim=True).to(torch.float32) / _KV_FP8_MAX
+        ).clamp_min(1e-6)
+        entry[f"{name}_fp8"] = (tensor.to(torch.float32) / scale).to(torch.float8_e4m3fn)
+        entry[f"{name}_scale"] = scale
+    entry["fp8"] = True
+    return entry
+
+
+def kv_entry_tensors(
+    entry: Dict[str, object],
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """Materialise an entry as (key, value) on `device` (dequantising if needed)."""
+    key = entry.get("key")
+    value = entry.get("value")
+    if key is not None and value is not None:
+        return key.to(device=device, dtype=dtype), value.to(device=device, dtype=dtype)
+    key_q = entry.get("key_fp8")
+    value_q = entry.get("value_fp8")
+    if key_q is None or value_q is None:
+        return None, None
+    key = (
+        key_q.to(device=device, dtype=torch.float32)
+        * entry["key_scale"].to(device=device, dtype=torch.float32)
+    ).to(dtype)
+    value = (
+        value_q.to(device=device, dtype=torch.float32)
+        * entry["value_scale"].to(device=device, dtype=torch.float32)
+    ).to(dtype)
+    return key, value
+
+
 def _concat_kv_entries(
     entries: Iterable[Dict[str, torch.Tensor]],
     *,
@@ -317,13 +379,9 @@ def _concat_kv_entries(
     for entry in entries:
         if entry is None:
             continue
-        key = entry.get("key")
-        value = entry.get("value")
+        key, value = kv_entry_tensors(entry, device=device, dtype=dtype)
         if key is None or value is None:
             continue
-
-        key = key.to(device=device, dtype=dtype)
-        value = value.to(device=device, dtype=dtype)
 
         if entry.get("pre_rope", False) and cached_freqs_cis is not None:
             cos_all, sin_all = cached_freqs_cis
@@ -851,11 +909,9 @@ class Transformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         if scope_store is None or layer_idx is None or self._kv_cache_chunk_id is None:
             return
         chunk_store = scope_store.setdefault(self._kv_cache_chunk_id, {})
-        chunk_store[layer_idx] = {
-            "key": _clone_kv_tensor(key),
-            "value": _clone_kv_tensor(value),
-            "pre_rope": bool(self._kv_cache_pre_rope),
-        }
+        chunk_store[layer_idx] = kv_entry_from_tensors(
+            key, value, pre_rope=bool(self._kv_cache_pre_rope)
+        )
         self._kv_cache_generation += 1
 
     def evict_kv_cache_chunks(self, chunk_ids_to_keep: set[int]) -> None:
