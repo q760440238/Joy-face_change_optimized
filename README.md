@@ -1,168 +1,107 @@
-<h1 align="center">JoyAI-Video-Edit</h1>
-<h3 align="center">Real-Time Open-Ended Video Editing with Autoregressive Diffusion</h3>
+# Joy-face_change_optimized
 
-<p align="center">
-  <a href="https://arxiv.org/abs/2608.03974"><img src="https://img.shields.io/badge/Paper-arXiv-red" alt="Paper"></a>
-  <a href="https://huggingface.co/jdopensource/JoyAI-Video-Edit"><img src="https://img.shields.io/badge/%F0%9F%A4%97%20Checkpoint-JoyAI--Video--Edit-yellow" alt="Hugging Face"></a>
-  <a href="https://huggingface.co/spaces/wxDai/joyai-video-edit"><img src="https://img.shields.io/badge/%F0%9F%9A%80%20Demo-Streaming--V2V-orange" alt="Demo"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" alt="License"></a>
-</p>
+[JoyAI-Video-Edit](https://github.com/jd-opensource/JoyAI-Video-Edit) 的优化分支（Apache-2.0）。
+目标：**降低部署门槛**——可移植算子、量化工具链、以及实测出来的精度/显存结论。
 
-<p align="center">
-  <img src="assets/teaser.jpg" width="96%" alt="JoyAI-Video-Edit teaser">
-</p>
+- GitHub: https://github.com/q760440238/Joy-face_change_optimized
+- Hugging Face: https://huggingface.co/kylinfires/Joy-face_change_optimized
+- 魔搭: https://www.modelscope.cn/models/kylinfires/Joy-face_change_optimized
 
-JoyAI-Video-Edit is a real-time, instruction-guided video editing system for open-ended video streams. Given a live camera stream or uploaded video and a natural-language edit instruction, it edits frames causally as they arrive, without waiting for the full video, requiring a predefined video length, or revisiting future frames. In our deployment benchmark, the full end-to-end pipeline reaches 30 FPS at 720 × 1248, pushing video editing from offline batch processing toward interactive streaming generation.
+## 本分支做了什么
 
-The system combines an MLLM-based condition encoder, a causal video VAE, and a 16B-parameter multimodal diffusion transformer. It is trained and deployed as an autoregressive diffusion editor, then accelerated with aligned autoregressive distribution matching distillation, long-horizon optimization, bounded KV-state inference, and deployment-oriented scheduling to sustain high-throughput 720p editing while reducing train-inference mismatch and accumulated temporal drift.
+| 文件 | 作用 |
+|---|---|
+| `deploy/xvideo/models/dit/fused_ops_torch.py` | 用纯 PyTorch 复刻 `joyomni_ops` 的 CUDA kernel（LayerNorm+modulate、QK-norm+3D RoPE、RMSNorm） |
+| `deploy/xvideo/models/dit/sgl_fused_ops.py` | `joyomni_ops` 不可用时自动回退到上面的实现（ROCm / CPU 也能跑） |
+| `deploy/xvideo/models/dit/int4_linear.py` | int4（分组）与 int8（逐通道）的 weight-only Linear，含加载器 |
+| `deploy/xvideo/models/models.py` | 新增 `JOYOMNI_DIT_SD_DIR`（bf16 分片）与 `JOYOMNI_DIT_INT4_DIR`（量化权重）两条加载路径 |
+| `tools/quantization/` | RTN int4 (gs=64)、int8、attn-int8/MLP-int4 (gs=16) 三套量化脚本 |
+| `tools/jve_client.py` | 无头 WebSocket 驱动（参考图 + 指令 + 帧序列），用于自动化验证 |
 
-## 🔥🔥🔥 News!!
+PyTorch 回退与 CUDA 版**逐张量验证一致**：99.997% 元素完全相同，最大偏差 1 个 bf16 ulp。
 
-- 2026.10.09: 🎉 We open-source our **[example training scripts](training/README.md)** and release **[LongV2VBench](https://huggingface.co/datasets/EasonXiao-888/LongV2VBench)** for long-form video-to-video editing evaluation.
-- 2026.08.24: 🎉 Consumer GPU support landed — real-time streaming video editing on a single GeForce RTX 5090 (32 GB): 840 × 480 @ 24 FPS. **[Deployment Guide](DEPLOYMENT.md)**
-- 2026.08.15: 🎉 Live demo released — real-time streaming video editing on a single RTX PRO 6000 (Blackwell) GPU: 840 × 480 @ 24 FPS or 720p @ 16 FPS. **[Try HuggingFace Demo](https://huggingface.co/spaces/wxDai/joyai-video-edit)**
-- 2026.08.14: 🎉 Released an upgraded checkpoint with significantly stronger reference-image-guided video editing (RV2V), delivering better subject and identity preservation, more faithful reference conditioning, and improved temporal consistency across long streams. Grab the new **[DiT weights](https://huggingface.co/jdopensource/JoyAI-Video-Edit/blob/main/dit/joyai_video_edit_dit_0811.pth)**.
-- 2026.08.05: 🎉 We release the deployment code, [technical report](https://arxiv.org/abs/2608.03974), and JoyAI-Video-Edit checkpoints. Please check the links above for details.
+## 量化实测结论（840×480，同权重同素材同 prompt）
 
-## 💎 Highlights
+| 精度 | 权重体积 | 与 bf16 的 PSNR | 参考人物相似度 |
+|---|---:|---:|---:|
+| bf16（基线） | 31.8 GB | — | 0.314 |
+| **int8（逐通道）** | 15.2 GiB | 21.8 dB | **0.359** ✅ |
+| int4 (gs=64) | 8.1 GiB | 19.0 dB | 0.103 ❌ |
+| attn int8 + MLP int4 (gs=16) | 11.4 GiB | 19.2 dB | 0.199 ⚠️ |
 
-- **Real-time open-ended editing.** Edits live or uploaded videos as frames arrive, without requiring the full sequence upfront.
-- **Diverse instruction control.** Supports subject edits, local edits, background changes, style transfer, motion changes, and reference-guided editing.
-- **Autoregressive diffusion design.** Combines an MLLM condition encoder, causal video VAE, and MMDiT backbone for streaming video editing.
-- **High-throughput 720p deployment.** Reaches 30 FPS end-to-end throughput at 720 × 1248 with bounded KV-state inference and stable per-chunk compute.
+流水线跨重启完全确定（同一份 int4 权重在两个新进程里跑出 **138 dB**，身份相似度 0.103 vs 0.103），所以上述差异是真实损失而非测量噪声。
 
-## 🕹️ Live Demo
+**结论：int4 会摧毁"参考图换人"能力，int8 不会。** 身份信息完全走注意力通路——只把注意力压到 int4、MLP 全保 bf16，换人也会失效（0.027）。
 
-Point your webcam at yourself, type an instruction, and watch the edit stream back in real time — try it in the browser: **[Hugging Face Demo](https://huggingface.co/spaces/wxDai/joyai-video-edit)**. The screenshots below are captured live from it (left: camera source, right: streamed result).
+## 优化方向
 
-<p align="center">
-  <img src="assets/live_demo/live_cartoon_group.jpg" width="96%" alt="Live demo — turn all people into cartoon style">
-</p>
+### 1. 剥离文本流权重（最大收益，进行中）
 
-<table>
-  <tr>
-    <td><img src="assets/live_demo/live_optimus_prime.jpg" alt="Live demo — transform into Optimus Prime with background unchanged"></td>
-    <td><img src="assets/live_demo/live_gundam.jpg" alt="Live demo — transform into a Gundam via reference-guided editing"></td>
-  </tr>
-  <tr>
-    <td><img src="assets/live_demo/live_hanfu_palace.jpg" alt="Live demo — Ming-style gown outfit change with ancient palace background"></td>
-    <td><img src="assets/live_demo/live_cel_anime.jpg" alt="Live demo — add cap and sunglasses, convert to hand-drawn cel animation"></td>
-  </tr>
-</table>
+模型每层的参数构成：
 
-## 🚧 TODO
+| 分支 | 每 block | ×40 | 占比 |
+|---|---:|---:|---:|
+| 图像流 `img_attn + img_mlp` | 201 M | 8.05 B | 49.5% |
+| **文本流 `txt_attn + txt_mlp`** | **201 M** | **8.05 B** | **49.5%** |
 
-- [x] **Stronger model version in progress.** A more powerful version is under active development, with a particular focus on advancing reference-image-guided video editing (RV2V) capabilities.
-- [x] **Consumer GPU support.** Optimize deployment for consumer-grade GPUs such as GeForce RTX 5090.
-- [x] **LongV2VBench release.** Release LongV2VBench for long-form video-to-video editing evaluation.
-- [x] **Release full training and data pipelines.** Open-source the training framework and data generation pipeline.
-- [ ] **Diffusers support.** Provide a 🤗 Diffusers pipeline for JoyAI-Video-Edit to streamline loading and inference.
+文本 token 的 K/V 只依赖指令，**与画面无关**，一次会话内指令不变。因此可以：
 
-## 🎬 Showcase
+1. 会话开始时跑**一次**文本分支，逐层缓存 `txt_k`（qk-norm 之后）、`txt_v`
+2. 之后每个 chunk 传 `skip_text_stream=True`，attention 的 K/V = 当前图像 + 静态缓存（文本 + 参考图）
+3. 预填充完成后把 **8.05 B 文本流权重卸到 CPU 内存**
 
-JoyAI-Video-Edit is designed for broad video editing tasks, including global appearance changes, local object edits, subject add/remove/replace, background replacement, style transfer, and reference-guided edits.
+代码基础已经具备：`dit.py` 的 block forward 本来就有 `skip_text_stream` 参数，`pipeline._prefill_static_reference_kv_cache()` 已经用同一套 KV 缓存机制给参考图做静态预填充。
 
-https://github.com/user-attachments/assets/bca232c9-75df-46f9-b366-14cfa2651994
+| 组成 | 现状 | 剥离后 |
+|---|---:|---:|
+| 图像流权重 | 8.05 GB | 8.05 GB |
+| 文本流权重 | 8.05 GB | **0**（常驻内存） |
+| VAE + graph + KV | 7.7 GB | 7.7 GB |
+| **合计** | **23.9 GB** | **~15.8 GB** |
 
-<table>
-  <tr>
-    <th>Source</th>
-    <th>Prompt</th>
-    <th>Edited</th>
-  </tr>
-  <tr>
-    <td><a href="https://github.com/user-attachments/assets/dc7c3cf6-de0b-4b7b-9afe-d4e38c4ea6e1"><img src="assets/cases/case01_source.gif" width="220" alt="Case 01 source"></a></td>
-    <td>Transform the people, hairstyles, and interior into a British castle aristocratic style.</td>
-    <td><a href="https://github.com/user-attachments/assets/dbb9b6de-9d63-4879-8418-96610eac79b3"><img src="assets/cases/case01_edited.gif" width="220" alt="Case 01 edited"></a></td>
-  </tr>
-  <tr>
-    <td><a href="https://github.com/user-attachments/assets/79792d23-7037-43c2-b185-dfd529aac3b7"><img src="assets/cases/case02_source.gif" width="220" alt="Case 02 source"></a></td>
-    <td>Turn the video into a watercolor wash style.</td>
-    <td><a href="https://github.com/user-attachments/assets/a20dea9d-715f-45b6-ae1d-b8c694983910"><img src="assets/cases/case02_edited.gif" width="220" alt="Case 02 edited"></a></td>
-  </tr>
-  <tr>
-    <td><a href="https://github.com/user-attachments/assets/92c1723b-78a6-4b04-837d-21545aeff823"><img src="assets/cases/case03_source.gif" width="220" alt="Case 03 source"></a></td>
-    <td>Make all dogs white, add colorful hats, and turn the sunglasses hot pink.</td>
-    <td><a href="https://github.com/user-attachments/assets/8412d011-9b08-46c8-820e-ab59e97773d4"><img src="assets/cases/case03_edited.gif" width="220" alt="Case 03 edited"></a></td>
-  </tr>
-  <tr>
-    <td><a href="https://github.com/user-attachments/assets/e9d70802-96e8-4aa4-a577-9e9cf0f8705c"><img src="assets/cases/case04_source.gif" width="220" alt="Case 04 source"></a></td>
-    <td>Dress the girl in a brown down jacket and blue baseball cap.</td>
-    <td><a href="https://github.com/user-attachments/assets/5ae898bd-ee26-4a63-9342-72430c28b82f"><img src="assets/cases/case04_edited.gif" width="220" alt="Case 04 edited"></a></td>
-  </tr>
-  <tr>
-    <td><a href="https://github.com/user-attachments/assets/b7b5e199-080c-4344-924e-01951fd05912"><img src="assets/cases/case05_source.gif" width="220" alt="Case 05 source"></a></td>
-    <td>Remove the two white cats in pink clothes on both sides.</td>
-    <td><a href="https://github.com/user-attachments/assets/8e1874b8-755c-4bb0-914d-155110501076"><img src="assets/cases/case05_edited.gif" width="220" alt="Case 05 edited"></a></td>
-  </tr>
-</table>
+即 **16 GB 显卡可跑**，且用 int8（质量 0.359 优于 bf16 的 0.314），不靠 int4 硬压。额外收益：每 chunk 少算 40 次 `txt_mlp`，帧率预计 +30~40%。
 
-**RV2V:** Put the coat/dress/shirt ... from Image 1 on the model in the video
+> 状态：方案与代码路径已确认，实现待完成。验收标准：缓存版 vs 完整版 PSNR > 40 dB、身份相似度差 < 0.01。
 
-https://github.com/user-attachments/assets/e887d087-af71-4de1-b5d3-bbfbd32922d8
+### 2. 其他方向
 
+- **MLP 5-bit**：注意力 int8 + MLP 5-bit 约 13.3 GiB，误差预计 0.35%，相似度有望到 0.27–0.29
+- **参考图 KV 复用**：同一张参考图跨会话复用，省一次 prefill
+- **VAE 分时驻留**：encode/decode 之间释放对方，省约 0.7 GB
+- **HEAD 输出量化**：`proj_out` 与 `img_in` 保持 bf16（已默认）
 
-## 📦 Model Download
-
-Download the released JoyAI-Video-Edit weights from [Hugging Face](https://huggingface.co/jdopensource/JoyAI-Video-Edit), then place them under:
-
-```text
-deploy/deps/checkpoints/JoyAI-Video-Edit/
-|-- dit/
-|   `-- joyai_video_edit_dit_0811.pth
-`-- vae/
-    |-- config.json
-    `-- diffusion_pytorch_model.safetensors
-```
-
-<a id="quick-start"></a>
-
-## 🚀 Quick Start
-
-### 1. Install
+## 快速开始
 
 ```bash
-conda create -n joyai-video-edit python=3.10 -y
-conda activate joyai-video-edit
 python -m pip install -r deploy/requirements.txt
+
+# 三种权重加载方式（互不影响）
+# 1) 原始 .pth（默认）
+# 2) bf16 分片
+export JOYOMNI_DIT_SD_DIR=/path/to/diffusers/transformer
+# 3) 量化权重
+export JOYOMNI_DIT_INT4_DIR=/path/to/int8_export
+
+bash deploy/run_server.sh
 ```
 
-Then build the in-tree CUDA op library `deploy/joyomni_ops` (**required** — the DiT calls its fused kernels at runtime) and, per GPU, SageAttention / flash-attn-4: follow [`DEPLOYMENT.md` §2](DEPLOYMENT.md#2-prepare-the-environment).
-
-### 2. Prepare Checkpoints
-
-Download the released weights from the Hugging Face link above. MiMo-VL is a required external dependency; the ONNX detectors are optional (missing files just disable the corresponding gates). See [`DEPLOYMENT.md`](DEPLOYMENT.md) for details.
-
-### 3. Launch
+量化：
 
 ```bash
-cd deploy
-bash run_server.sh
+python tools/quantization/quantize_int8.py     # 15.2 GiB，质量可用
+python tools/quantization/quantize_int4.py     # 8.1 GiB，会摧毁换人能力
 ```
 
-Then open:
+---
 
-```text
-http://localhost:8080
-```
+## English (concise)
 
-The server binds `0.0.0.0:8080` by default — for remote machines, just open the port (or use SSH port forwarding).
+Fork of [JoyAI-Video-Edit](https://github.com/jd-opensource/JoyAI-Video-Edit) (Apache-2.0) focused on deployability.
 
-## 📚 Citation
+**Adds:** pure-PyTorch equivalents of the `joyomni_ops` CUDA kernels (bit-exact, max 1 bf16 ulp) with automatic fallback for ROCm/CPU; int4/int8 weight-only Linear plus state-dict loaders; three quantization recipes; a headless WebSocket client.
 
-If JoyAI-Video-Edit is useful for your research or product prototype, please cite:
+**Measured (840x480, identical weights/prompt/frames):** bf16 identity 0.314 → **int8 0.359** (15.2 GiB) → attn-int8+MLP-int4 0.199 (11.4 GiB) → int4 0.103 (8.1 GiB). The pipeline is deterministic across restarts (138 dB on identical int4 weights), so these are real. **int4 breaks reference-guided person swapping; int8 preserves it** — the identity signal lives entirely in the attention path.
 
-```bibtex
-@article{xiao2026joyai,
-  title={JoyAI-Video-Edit: Real-Time Open-Ended Video Editing with Autoregressive Diffusion},
-  author={Xiao, Yicheng and Dai, Wenxun and Qin, Xinran and Song, Lin and Zhang, Maoquan and Xu, Hang and Chen, Yukang and Li, Yitong and Zhang, Guohui and Zhang, Yuan and Zhang, Xuying and Zhang, Tommy and Yuan, Jianlong and Li, Peihao and Lu, Shuai and Fu, Siming and Zhao, Chuyang and Han, Xin and Huang, Jie and Li, Wenbo and Ma, Guoqing and Huang, Wei and Qi, Xiaojuan and Huang, Haoyang and Duan, Nan},
-  journal={arXiv preprint arXiv:2608.03974},
-  year={2026}
-}
-```
+**Optimization in progress — strip the text stream:** the txt branch (`txt_attn + txt_mlp`) is 8.05 B params, 49.5% of the model. Text K/V depends only on the prompt, so it can be prefilled once per session, cached as static KV, and the weights offloaded to host RAM. The block forward already accepts `skip_text_stream=True` and the pipeline already prefills static KV for the reference image. Expected: **23.9 GB → ~15.8 GB**, enabling 16 GB cards at int8 quality, plus 30-40% faster chunks.
 
-<a id="license"></a>
-
-## ⚖️ License Agreement
-
-JoyAI-Video-Edit is licensed under Apache 2.0.
+See `NOTICE` for the list of modified files.
