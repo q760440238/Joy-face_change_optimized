@@ -118,6 +118,23 @@ def fp8_precision_report(transformer, *, base_precision: str) -> tuple[dict, str
 
 from xvideo.models.dit import sgl_fused_ops as _sgl_fused
 
+# --- text-stream KV capture (for stripping the txt stream at inference) -----
+# Populated only while a capture is active: layer_idx -> (txt_k, txt_v).
+_TEXT_KV_SINK: dict | None = None
+
+
+def begin_text_kv_capture() -> dict:
+    global _TEXT_KV_SINK
+    _TEXT_KV_SINK = {}
+    return _TEXT_KV_SINK
+
+
+def end_text_kv_capture() -> dict | None:
+    global _TEXT_KV_SINK
+    sink, _TEXT_KV_SINK = _TEXT_KV_SINK, None
+    return sink
+
+
 from xvideo.models.dit.rope import apply_rotary_emb, get_1d_rotary_pos_embed
 
 
@@ -395,6 +412,8 @@ class MMDoubleStreamBlock(nn.Module):
             txt_q, txt_k, txt_v = _tv[:, :, 0], _tv[:, :, 1], _tv[:, :, 2]
             txt_q = self.txt_attn_q_norm(txt_q).to(txt_v.dtype)
             txt_k = self.txt_attn_k_norm(txt_k).to(txt_v.dtype)
+            if _TEXT_KV_SINK is not None:
+                _TEXT_KV_SINK[layer_idx] = (txt_k.detach(), txt_v.detach())
 
         if skip_text_stream:
             q = img_q
