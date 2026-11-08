@@ -134,6 +134,15 @@ def end_text_kv_capture() -> dict | None:
     sink, _TEXT_KV_SINK = _TEXT_KV_SINK, None
     return sink
 
+# Installed by the pipeline for the duration of one denoise step:
+# layer_idx -> (txt_k, txt_v), already qk-normed. None disables the fast path.
+_TEXT_KV_ACTIVE: dict | None = None
+
+
+def set_text_kv_active(cache: dict | None) -> None:
+    global _TEXT_KV_ACTIVE
+    _TEXT_KV_ACTIVE = cache
+
 
 from xvideo.models.dit.rope import apply_rotary_emb, get_1d_rotary_pos_embed
 
@@ -447,6 +456,11 @@ class MMDoubleStreamBlock(nn.Module):
         if cached_key is not None:
             k = torch.cat([cached_key, k], dim=1)
             v = torch.cat([cached_value, v], dim=1)
+        if skip_text_stream and _TEXT_KV_ACTIVE is not None:
+            _tkv = _TEXT_KV_ACTIVE.get(layer_idx)
+            if _tkv is not None:
+                k = torch.cat([k, _tkv[0].to(dtype=k.dtype, device=k.device)], dim=1)
+                v = torch.cat([v, _tkv[1].to(dtype=v.dtype, device=v.device)], dim=1)
 
         attn = _flash_attention4(q, k, v)
         attn = attn.flatten(2, 3)
