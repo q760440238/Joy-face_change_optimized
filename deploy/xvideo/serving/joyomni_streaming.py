@@ -869,9 +869,12 @@ class JoyOmniV2VStreamingSession:
             if vae is None:
                 continue
             for tensor in _on_device(vae):
-                if id(tensor) in seen_vae_tensors:
+                # decode/pseudo roles hold their own tensor objects over the same
+                # storage, so dedupe on the storage address, not the object id.
+                key = (tensor.data_ptr(), tensor.numel())
+                if key in seen_vae_tensors:
                     continue
-                seen_vae_tensors.add(id(tensor))
+                seen_vae_tensors.add(key)
                 vae_bytes += tensor.numel() * tensor.element_size()
         text_kv_bytes = 0
         for cache in (self._text_kv_by_step or ()):
