@@ -692,6 +692,7 @@ class JoyOmniV2VStreamingSession:
 
         self._maybe_prepare_graph_runner()
         self._maybe_offload_text_stream()
+        self._log_memory_breakdown("init")
 
         self.initialized = True
 
@@ -773,6 +774,61 @@ class JoyOmniV2VStreamingSession:
         torch.cuda.empty_cache()
         print(
             f"#####[TEXT-KV] text weights parked back on host ({time.perf_counter() - started:.2f}s)",
+            flush=True,
+        )
+
+    def _log_memory_breakdown(self, tag: str) -> None:
+        """JOYOMNI_MEM_REPORT=1: print where the device memory went."""
+        if os.environ.get("JOYOMNI_MEM_REPORT", "").strip().lower() not in {"1", "true", "yes", "on"}:
+            return
+        if self.device_type != "cuda":
+            return
+        tf = self.pipeline.transformer
+
+        def _bytes(tensors):
+            return sum(t.numel() * t.element_size() for t in tensors)
+
+        def _on_device(module):
+            return [
+                t for t in list(module.parameters()) + list(module.buffers())
+                if t.device.type == "cuda"
+            ]
+
+        dit_bytes = _bytes(_on_device(tf))
+        seen, vae_bytes = set(), 0
+        for vae in (self.pipeline.vae, self.decode_vae, self.pseudo_encode_vae):
+            if vae is None or id(vae) in seen:
+                continue
+            seen.add(id(vae))
+            vae_bytes += _bytes(_on_device(vae))
+        text_kv_bytes = 0
+        for cache in (self._text_kv_by_step or ()):
+            for key, value in cache.values():
+                text_kv_bytes += key.numel() * key.element_size() + value.numel() * value.element_size()
+        kv_store_bytes = 0
+        scope_store = tf._inference_kv_cache.get(tf._kv_cache_scope or "cond", {})
+        for chunk_store in scope_store.values():
+            for entry in chunk_store.values():
+                for name in ("key", "value"):
+                    tensor = entry.get(name)
+                    if tensor is not None:
+                        kv_store_bytes += tensor.numel() * tensor.element_size()
+        graph_bytes = sum(
+            runner.static_bytes()
+            for runner in self.runtime.graph_runners.values()
+            if runner is not None and getattr(runner, "ready", False)
+        )
+        allocated = torch.cuda.memory_allocated(self.device)
+        reserved = torch.cuda.memory_reserved(self.device)
+        free_b, total_b = torch.cuda.mem_get_info(self.device)
+        other = allocated - dit_bytes - vae_bytes - graph_bytes - kv_store_bytes - text_kv_bytes
+        print(
+            f"#####[MEM] {tag}: nvidia={(total_b - free_b) / 2**30:.2f} GiB "
+            f"alloc={allocated / 2**30:.2f} reserved={reserved / 2**30:.2f} "
+            f"peak={torch.cuda.max_memory_allocated(self.device) / 2**30:.2f} | "
+            f"dit={dit_bytes / 2**30:.2f} vae={vae_bytes / 2**30:.2f} "
+            f"graph={graph_bytes / 2**30:.2f} kv_store={kv_store_bytes / 2**30:.2f} "
+            f"text_kv={text_kv_bytes / 2**30:.2f} other={other / 2**30:.2f}",
             flush=True,
         )
 
@@ -1290,6 +1346,8 @@ class JoyOmniV2VStreamingSession:
         profile: dict[str, Any],
         total_started: float,
     ) -> None:
+        if int(profile.get("chunk_idx", -1)) in (0, 2):
+            self._log_memory_breakdown(f"chunk{profile['chunk_idx']}")
         if self.settings.profile_timings:
             self._timer_record(profile, "total_server_chunk_s", total_started)
         else:

@@ -107,6 +107,19 @@ class StreamingGraphRunner:
         self.bound_token: Optional[int] = None
         self.last_graph_chunk = -(10 ** 9)
 
+    def static_bytes(self) -> int:
+        """Bytes held by the graph's static buffers (KV pool, staging, I/O)."""
+        tensors = [
+            self.pool_k, self.pool_v, self.stage_k, self.stage_v, self.pub_k, self.pub_v,
+            self.in_latent, self.in_timestep, self.in_ref_latent, self.in_store_latent,
+            self.in_store_timestep, self.in_prompt, self.in_current_ids, self.in_noise,
+            self.out_latents, self.pos_cos, self.pos_sin, self.commit_cos, self.commit_sin,
+        ]
+        for cache in self.text_kv_by_step:
+            for key, value in cache.values():
+                tensors.extend((key, value))
+        return sum(t.numel() * t.element_size() for t in tensors if isinstance(t, torch.Tensor))
+
     def _pool_assembler(self, layer_idx, *, device, dtype, cached_freqs_cis=None):
         return self.pool_k[layer_idx], self.pool_v[layer_idx]
 
