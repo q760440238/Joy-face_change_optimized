@@ -668,6 +668,11 @@ class JoyOmniV2VStreamingSession:
         if self.initialized:
             return
 
+        # The VAE posterior draws (reference image, pseudo latents) use the global
+        # RNG, so without this two sessions of the same prompt anchor on different
+        # references. Pin them per session; self.generator still drives the noise.
+        seed_everything(int(self.settings.seed))
+
         if not getattr(self.pipeline.transformer.config, "causal", False):
             raise ValueError("Online streaming requires a causal transformer config.")
         self.pipeline.transformer.config.use_inference_kv_cache = True
