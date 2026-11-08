@@ -93,6 +93,8 @@ PyTorch 回退与 CUDA 版**逐张量验证一致**：99.997% 元素完全相同
 - 速度换显存：每 chunk 要把 7.8 GiB 权重过一次 PCIe，实测约 3 倍慢（~7 fps）。
 - 注意：block 的 fp8 量化必须在 GPU 上做——CPU 的 fp8 取整与 CUDA 差约 0.07% 的元素（1 ulp），
   40 层放大后输出会漂 28.6 dB（已修，现在逐帧一致）。
+- **分辨率**：VAE stem 要求宽、高都是 **24 的倍数**（`640×368` 会被服务端拒绝）；8 GB 想更快可用 `624×360`（桌面预设 `8g-640`）。
+- **双缓冲预取**（实验）：`JOYOMNI_STREAM_PREFETCH=1` 把 chunk 从 0.76–1.32 s 压到 0.60–1.17 s，但与单缓冲相比输出漂 25.5 dB（copy/compute 顺序仍有问题），默认关。
 
 ### 2. 其他方向（本轮实测）
 
@@ -106,6 +108,18 @@ PyTorch 回退与 CUDA 版**逐张量验证一致**：99.997% 元素完全相同
   （time_proj / time_embedder / text_embedder，152 M，291 MiB bf16）转成 FP8，省 145 MiB；
   但与 bf16 输出差 **23.2 dB**（可复现测量），与整模型 8-bit 量化的 21.8 dB 同量级 —— 调制向量太敏感。
 - **MLP 5-bit**：注意力 int8 + MLP 5-bit 约 13.3 GiB，误差预计 0.35%，相似度有望到 0.27–0.29（未做）
+
+## 桌面版
+
+```bash
+python deploy/jve_desktop.py --preset 16g      # 24 GB 卡（5090/4090）
+python deploy/jve_desktop.py --preset 8g       # 8 GB 卡，840×480
+python deploy/jve_desktop.py --preset 8g-640   # 8 GB 卡，624×360（更快）
+python deploy/jve_desktop.py --check           # 只打印将要使用的环境，不启动
+```
+
+它会把预设的环境变量拼好、启动 `deploy/run_server.sh`、等 `/health`，然后用 pywebview 开一个桌面窗口
+（没装 pywebview 就退回默认浏览器），关窗口即停服务；`--no-window` 只跑服务，`--timeout` 调启动超时。
 
 ## 快速开始
 
