@@ -860,8 +860,8 @@ class JoyOmniV2VStreamingSession:
         tf = self.pipeline.transformer
         if not getattr(tf, "_text_stream_offloaded", False) or self.device_type != "cuda":
             return False
-        if tight_vram_enabled():
-            # Staging the stream needs 7.5 GiB of headroom; page it instead.
+        if tight_vram_enabled() or getattr(tf, "_text_stream_paged", False):
+            # Staging needs 7.5 GiB of headroom; the pager is cheaper anyway.
             return False
         need = text_stream_bytes(tf)
         free_b, _total_b = torch.cuda.mem_get_info(self.device)

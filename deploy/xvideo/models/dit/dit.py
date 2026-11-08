@@ -1,6 +1,7 @@
 from contextlib import contextmanager
 import logging
 import os
+import time
 from typing import Callable, Dict, Iterable, List, Tuple, Optional
 import math
 
@@ -196,6 +197,106 @@ def move_block_text_stream(block, device) -> int:
     return moved
 
 
+def _text_tensor_chains(block):
+    """Yield (attr_chain, is_param, tensor) for every leaf tensor of the text modules."""
+    for root in _TEXT_STREAM_ATTRS:
+        module = getattr(block, root, None)
+        if not isinstance(module, nn.Module):
+            continue
+        for path, sub in module.named_modules():
+            steps = tuple(path.split(".")) if path else ()
+            for is_param, table in ((True, sub._parameters), (False, sub._buffers)):
+                for name, tensor in list(table.items()):
+                    if tensor is None:
+                        continue
+                    yield (root, *steps, name), is_param, tensor
+
+
+def _resolve_chain(block, chain):
+    obj = block
+    for step in chain[:-1]:
+        obj = getattr(obj, step)
+    return obj, chain[-1]
+
+
+def _bind_tensor(obj, name, tensor, is_param: bool) -> None:
+    if is_param:
+        obj._parameters[name] = nn.Parameter(tensor, requires_grad=False)
+    else:
+        obj._buffers[name] = tensor
+
+
+class _TextStreamPager:
+    """Keep the text weights in host RAM and page them in one block at a time.
+
+    One GPU slot per tensor (shared by all blocks, they are identical), one
+    pinned host mirror per block. Page-in/page-out are plain `copy_` calls on the
+    current stream, so they are ordered with the block's kernels.
+    """
+
+    def __init__(self, transformer, device: torch.device):
+        blocks = list(transformer.double_blocks)
+        template = list(_text_tensor_chains(blocks[0]))
+        self.device = device
+        self.blocks = blocks
+        self.specs = [(chain, is_param) for chain, is_param, _ in template]
+        self.slots = [
+            torch.empty_strided(tensor.size(), tensor.stride(), dtype=tensor.dtype, device=device)
+            for _, _, tensor in template
+        ]
+        self.hosts: list[list[torch.Tensor]] = []
+        pinned = 0
+        for block in blocks:
+            hosts = []
+            for chain, is_param in self.specs:
+                obj, name = _resolve_chain(block, chain)
+                tensor = (obj._parameters if is_param else obj._buffers)[name]
+                if not tensor.is_pinned():
+                    try:
+                        tensor = tensor.pin_memory()
+                        _bind_tensor(obj, name, tensor, is_param)
+                        pinned += 1
+                    except Exception:  # noqa: BLE001 - pinned memory is best effort
+                        pass
+                hosts.append(tensor)
+            self.hosts.append(hosts)
+        self.pinned_tensors = pinned
+        self.bytes = sum(t.numel() * t.element_size() for t in self.slots)
+
+    def _bind(self, layer_idx: int, tensors) -> None:
+        block = self.blocks[layer_idx]
+        for (chain, is_param), tensor in zip(self.specs, tensors):
+            obj, name = _resolve_chain(block, chain)
+            _bind_tensor(obj, name, tensor, is_param)
+
+    def page_in(self, layer_idx: int) -> None:
+        hosts = self.hosts[layer_idx]
+        for slot, host in zip(self.slots, hosts):
+            slot.copy_(host, non_blocking=True)
+        self._bind(layer_idx, self.slots)
+
+    def page_out(self, layer_idx: int) -> None:
+        hosts = self.hosts[layer_idx]
+        for slot, host in zip(self.slots, hosts):
+            host.copy_(slot, non_blocking=True)
+        self._bind(layer_idx, hosts)
+
+
+def _ensure_text_pager(transformer, device) -> "_TextStreamPager":
+    pager = getattr(transformer, "_text_stream_pager", None)
+    if pager is None:
+        started = time.time()
+        pager = _TextStreamPager(transformer, device)
+        pager.blocks = transformer.double_blocks
+        transformer._text_stream_pager = pager
+        print(
+            f"#####[TEXT-PAGER] {pager.bytes / 2**20:.0f} MiB of GPU slots, "
+            f"{len(pager.hosts)} blocks, {pager.pinned_tensors} tensors pinned, "
+            f"built in {time.time() - started:.2f}s",
+            flush=True,
+        )
+    return pager
+
 def move_text_stream(transformer, device, pin: bool = True) -> int:
     """Move the whole text stream to `device` (host RAM by default).
 
@@ -203,6 +304,8 @@ def move_text_stream(transformer, device, pin: bool = True) -> int:
     K/V capture runs at PCIe speed instead of pageable-RAM speed.
     """
     device = torch.device(device)
+    # Any wholesale move invalidates the persistent slot/host mirrors.
+    transformer._text_stream_pager = None
     moved = 0
     for block in transformer.double_blocks:
         moved += move_block_text_stream(block, device)
@@ -1225,9 +1328,10 @@ class Transformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                 "text stream is offloaded to host: run with skip_text_stream=True and a "
                 "text K/V cache, or set transformer._text_stream_paged=True to page it in"
             )
+        _text_pager = _ensure_text_pager(self, device) if _text_paged else None
         for layer_idx, block in enumerate(self.double_blocks):
-            if _text_paged:
-                move_block_text_stream(block, device)
+            if _text_pager is not None:
+                _text_pager.page_in(layer_idx)
             img, txt = block(
                 img,
                 txt,
@@ -1244,8 +1348,8 @@ class Transformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                 kv_cache_pre_rope=kv_cache_pre_rope,
                 cached_freqs_cis=cached_freqs_cis,
             )
-            if _text_paged:
-                move_block_text_stream(block, "cpu")
+            if _text_pager is not None:
+                _text_pager.page_out(layer_idx)
 
         img = self.proj_out(self.norm_out(img))
 
