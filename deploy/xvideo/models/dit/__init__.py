@@ -8,6 +8,7 @@ from xvideo.models.dit.dit import (
     move_text_stream,
     kv_entry_from_tensors,
     kv_entry_tensors,
+    kv_cache_dtype,
     kv_fp8_enabled,
     move_block_text_stream,
     text_stream_bytes,

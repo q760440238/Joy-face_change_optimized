@@ -303,13 +303,23 @@ def attention_backend() -> str:
     return "SDPA (cuDNN/flash)"
 
 
+_KV_DTYPE_ENV = "JOYOMNI_KV_DTYPE"
 _KV_FP8_ENV = "JOYOMNI_KV_FP8"
 _KV_FP8_MAX = 448.0
+_KV_INT8_MAX = 127.0
+
+
+def kv_cache_dtype() -> str:
+    """Storage dtype of the cached image K/V: "bf16" (default), "fp8" or "int8"."""
+    raw = os.environ.get(_KV_DTYPE_ENV, "").strip().lower()
+    if not raw and os.environ.get(_KV_FP8_ENV, "").strip().lower() in {"1", "true", "yes", "on"}:
+        raw = "fp8"
+    return raw if raw in {"fp8", "int8"} else "bf16"
 
 
 def kv_fp8_enabled() -> bool:
-    """Store cached image K/V as FP8 (e4m3) with a per token/head scale."""
-    return os.environ.get(_KV_FP8_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+    """Backwards-compatible alias for the older boolean FP8 knob."""
+    return kv_cache_dtype() == "fp8"
 
 
 def kv_entry_from_tensors(
@@ -324,18 +334,22 @@ def kv_entry_from_tensors(
         entry["key"] = None
         entry["value"] = None
         return entry
-    if not kv_fp8_enabled():
+    dtype = kv_cache_dtype()
+    if dtype == "bf16":
         entry["key"] = _clone_kv_tensor(key)
         entry["value"] = _clone_kv_tensor(value)
         return entry
+    quant_max = _KV_FP8_MAX if dtype == "fp8" else _KV_INT8_MAX
     for name, tensor in (("key", key), ("value", value)):
-        tensor = tensor.detach()
-        scale = (
-            tensor.abs().amax(dim=-1, keepdim=True).to(torch.float32) / _KV_FP8_MAX
-        ).clamp_min(1e-6)
-        entry[f"{name}_fp8"] = (tensor.to(torch.float32) / scale).to(torch.float8_e4m3fn)
+        tensor = tensor.detach().to(torch.float32)
+        scale = (tensor.abs().amax(dim=-1, keepdim=True) / quant_max).clamp_min(1e-8)
+        scaled = (tensor / scale).clamp(-quant_max, quant_max)
+        if dtype == "fp8":
+            entry[f"{name}_q"] = scaled.to(torch.float8_e4m3fn)
+        else:
+            entry[f"{name}_q"] = scaled.round().to(torch.int8)
         entry[f"{name}_scale"] = scale
-    entry["fp8"] = True
+    entry["quant"] = dtype
     return entry
 
 
@@ -350,8 +364,8 @@ def kv_entry_tensors(
     value = entry.get("value")
     if key is not None and value is not None:
         return key.to(device=device, dtype=dtype), value.to(device=device, dtype=dtype)
-    key_q = entry.get("key_fp8")
-    value_q = entry.get("value_fp8")
+    key_q = entry.get("key_q")
+    value_q = entry.get("value_q")
     if key_q is None or value_q is None:
         return None, None
     key = (
