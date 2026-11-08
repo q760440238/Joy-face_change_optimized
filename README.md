@@ -63,6 +63,9 @@ PyTorch 回退与 CUDA 版**逐张量验证一致**：99.997% 元素完全相同
 > 注意：文本 K/V 缓存**本身不省显存**——启动时 24.8 GiB vs 基线 23.6 GiB（缓存 0.46 + graph 池 0.46），
 > 必须和 `JOYOMNI_TEXT_OFFLOAD` 一起用。表中数字为"跑完一个会话"后的 nvidia-smi，括号内为原始 MiB。
 > 文本 K/V 抓取的结果按（prompt embeds + 参考图 latent + steps + seed）做主机侧缓存（LRU 2），同一组输入的新会话直接拷回显存：首帧 **11.1 → 1.4 s**，逐帧与首次抓取 **138.13 dB** 完全一致（不同 prompt 各自 8–11 s 首次抓取，LRU 满时淘汰最旧一条）。
+>
+> 文本权重的搬运也重写了：原先每次抓取用 `module.to()` 逐张量搬 7.5 GiB（约 9.9 s），现在用「持久 GPU 槽位（0.19 GiB）+ pinned 主机镜像 + `copy_`」，抓取 **0.57 s**，首次 prompt 首帧 **11.1 → 3.8 s**（逐帧仍与旧实现 138.13 dB 一致）。
+
 
 - **16 GB 卡可跑**：`JOYOMNI_VRAM_CAP_GB=16` 的硬上限下 17 帧会话跑通（reserved 14.5 GiB，峰值 13.7 GiB）。
 - dit 每 chunk 0.219 → 0.185 s（graph 稳态，文本分支不再参与）。
@@ -70,6 +73,26 @@ PyTorch 回退与 CUDA 版**逐张量验证一致**：99.997% 元素完全相同
   身份相似度持平（0.67–0.69）；卸载与 tight 本身不改数值（逐帧 138 dB 一致）。
 - 可选 `JOYOMNI_KV_DTYPE=int8`：缓存的图像 K/V 存 int8（按 token/head 缩放），KV 1.44 → 0.74 GiB，稳态 15.3 → **14.7 GiB**；代价是与 bf16 缓存的输出差 **26.8 dB**（可复现测量），只在显存最紧时用。
 - 会话可复现：`seed_everything(seed)` 之后，同 prompt/seed 的连续两个会话逐帧一致（138 dB）；改动前因为参考图 VAE 采样走全局 RNG，两个会话相差约 25 dB。
+
+### 1.1 8 GB 卡：`JOYOMNI_STREAM_DIT=1`
+
+把 40 个 DiT block 留在主机内存，前向时逐 block 换入（fp8 每块 0.19 GiB，权重只读所以不需要搬回）。
+文本流仍走 K/V 缓存 + 卸载，graph 关闭。
+
+实测（`JOYOMNI_VRAM_CAP_GB=8` 硬上限，840×480）：
+
+| 指标 | 16 GB 配置 | **8 GB 流式** |
+|---|---:|---:|
+| 稳态 reserved | 14.48 GiB | **7.29 GiB** |
+| 峰值 allocated | 13.70 GiB | **6.57 GiB** |
+| 首帧 | 3.8 s（首次 prompt） | 4.3 s |
+| chunk（8 帧） | 0.31 s | **0.77–1.32 s** |
+| 输出 | — | 与 16 GB 配置逐帧 **138.13 dB** 一致 |
+
+- 主机内存：图像 block 约 7.8 GiB（fp8）+ 文本流 7.5 GiB，建议 **≥24 GiB RAM**。
+- 速度换显存：每 chunk 要把 7.8 GiB 权重过一次 PCIe，实测约 3 倍慢（~7 fps）。
+- 注意：block 的 fp8 量化必须在 GPU 上做——CPU 的 fp8 取整与 CUDA 差约 0.07% 的元素（1 ulp），
+  40 层放大后输出会漂 28.6 dB（已修，现在逐帧一致）。
 
 ### 2. 其他方向（本轮实测）
 
