@@ -295,10 +295,9 @@ class _TextStreamPager:
         self._bind(layer_idx, self.slots)
 
     def page_out(self, layer_idx: int) -> None:
-        hosts = self.hosts[layer_idx]
-        for slot, host in zip(self.slots, hosts):
-            host.copy_(slot, non_blocking=True)
-        self._bind(layer_idx, hosts)
+        # Inference never writes the weights, so the host mirrors are still
+        # authoritative: rebinding is enough, no copy-back needed.
+        self._bind(layer_idx, self.hosts[layer_idx])
 
 
 class _BlockPager:
@@ -319,22 +318,33 @@ class _BlockPager:
             for _, _, tensor in template
         ]
         self.hosts: list[list[torch.Tensor]] = []
+        pinned = 0
         for block in blocks:
             hosts = []
             for chain, is_param in self.specs:
                 obj, name = _resolve_chain(block, chain)
-                hosts.append((obj._parameters if is_param else obj._buffers)[name])
+                tensor = (obj._parameters if is_param else obj._buffers)[name]
+                if not tensor.is_pinned():
+                    try:
+                        tensor = tensor.pin_memory()
+                        pinned += 1
+                    except Exception:  # noqa: BLE001 - best effort
+                        pass
+                hosts.append(tensor)
             self.hosts.append(hosts)
+        # All blocks share the slots; every forward pages the block it is about to
+        # run over them, so the modules can stay bound to the slots permanently.
+        for block in blocks:
+            for (chain, is_param), slot in zip(self.specs, self.slots):
+                obj, name = _resolve_chain(block, chain)
+                _bind_tensor(obj, name, slot, is_param)
+        self._bound_once = True
+        self.pinned_tensors = pinned
         self.bytes = sum(t.numel() * t.element_size() for t in self.slots)
 
     def page_in(self, layer_idx: int) -> None:
-        hosts = self.hosts[layer_idx]
-        for slot, host in zip(self.slots, hosts):
+        for slot, host in zip(self.slots, self.hosts[layer_idx]):
             slot.copy_(host, non_blocking=True)
-        block = self.blocks[layer_idx]
-        for (chain, is_param), slot in zip(self.specs, self.slots):
-            obj, name = _resolve_chain(block, chain)
-            _bind_tensor(obj, name, slot, is_param)
 
 
 def _ensure_block_pager(transformer, device) -> "_BlockPager":
