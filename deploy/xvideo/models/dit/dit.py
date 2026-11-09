@@ -505,7 +505,12 @@ def _sdpa_attention(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor)
     q = query.transpose(1, 2)
     k = key.transpose(1, 2)
     v = value.transpose(1, 2)
-    with sdpa_kernel(_SDPA_BACKENDS, set_priority=True):
+    try:
+        with sdpa_kernel(_SDPA_BACKENDS, set_priority=True):
+            out = F.scaled_dot_product_attention(q, k, v, is_causal=False)
+    except RuntimeError:
+        # ROCm / HIP builds have no cuDNN or flash kernels: the backend list
+        # raises "No available kernel". The math backend always works.
         out = F.scaled_dot_product_attention(q, k, v, is_causal=False)
     return out.transpose(1, 2)
 
