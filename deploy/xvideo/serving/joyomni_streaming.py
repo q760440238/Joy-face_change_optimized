@@ -374,12 +374,17 @@ class JoyOmniRuntime:
             )
             _ref_hw = sorted({(c[3], c[4]) for c in _ref_cfgs})
             _vc.maybe_setup_encode_dynamic(_src_vae)
-            _vc.warmup_encode_dynamic(
-                _src_vae, 3, _ref_hw,
-                device=_module_device(_src_vae), dtype=_vae_dt,
-                temporal_lens=(1,),
-                autocast=False,
-            )
+            if os.environ.get("JOYOMNI_SKIP_REF_WARMUP", "0").strip().lower() in {
+                "1", "true", "yes", "on"
+            }:
+                print("#####[STREAM] reference-bucket warmup skipped (JOYOMNI_SKIP_REF_WARMUP)")
+            else:
+                _vc.warmup_encode_dynamic(
+                    _src_vae, 3, _ref_hw,
+                    device=_module_device(_src_vae), dtype=_vae_dt,
+                    temporal_lens=(1,),
+                    autocast=False,
+                )
         except Exception as _ve_exc:
             print(f"#####[STREAM] VAE encode compile warmup skipped: {_ve_exc!r}")
 
@@ -1438,20 +1443,35 @@ class JoyOmniV2VStreamingSession:
         self._timer_record(profile, "kv_store_setup_s", started)
 
         started = self._timer_start(self.device)
-        self.pipeline._store_clean_chunk_kv_cache(
-            self.pipeline.transformer,
-            clean_chunk_latents=current_chunk_latents.to(self.target_dtype),
-            chunk_temporal_ids=current_chunk_temporal_ids.unsqueeze(0).expand(
-                current_chunk_latents.shape[0], -1
-            ),
-            prompt_embeds=self.streaming_cond_embeds,
-            active_chunk_id=active_chunk_id,
-            history_chunk_ids=store_history_chunk_ids,
-            pre_rope=True,
-            cached_temporal_ids=store_cached_temporal_ids,
-            store_mode=store_mode,
+        _skip_store = (
+            os.environ.get("JOYOMNI_SKIP_STORE_AFTER_FIRST", "").strip().lower()
+            in {"1", "true", "yes", "on"}
+            and getattr(self, "_store_forwards_done", 0) >= 1
         )
-        self._timer_record(profile, "kv_store_forward_s", started)
+        if _skip_store:
+            # history-only conditioning: the chunk's own clean frames are not added
+            # to the KV cache (saves a full 40-block forward per chunk)
+            self._timer_record(profile, "kv_store_forward_s", started)
+            if tight_vram_enabled():
+                # nothing else releases the per-chunk transients when we skip the
+                # store forward; without this the allocator drifts up and crashes
+                torch.cuda.empty_cache()
+        else:
+            self.pipeline._store_clean_chunk_kv_cache(
+                self.pipeline.transformer,
+                clean_chunk_latents=current_chunk_latents.to(self.target_dtype),
+                chunk_temporal_ids=current_chunk_temporal_ids.unsqueeze(0).expand(
+                    current_chunk_latents.shape[0], -1
+                ),
+                prompt_embeds=self.streaming_cond_embeds,
+                active_chunk_id=active_chunk_id,
+                history_chunk_ids=store_history_chunk_ids,
+                pre_rope=True,
+                cached_temporal_ids=store_cached_temporal_ids,
+                store_mode=store_mode,
+            )
+            self._timer_record(profile, "kv_store_forward_s", started)
+        self._store_forwards_done = getattr(self, "_store_forwards_done", 0) + 1
         return current_chunk_latents
 
     def _evict_after_store(
