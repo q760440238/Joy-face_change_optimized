@@ -10,18 +10,34 @@ from xvideo.models.scheduler import FlowMatchDiscreteScheduler
 from xvideo.models.pipeline import Pipeline, PRECISION_TO_TYPE
 
 
+def _commit_gb() -> str:
+    """Process private commit + RSS (psutil), for memory-bound debugging."""
+    try:
+        import psutil
+
+        info = psutil.Process().memory_info()
+        return (
+            f"commit={info.private / 2**30:.1f}GiB rss={info.rss / 2**30:.1f}GiB "
+            f"sysfree={psutil.virtual_memory().available / 2**30:.1f}GiB"
+        )
+    except Exception:  # noqa: BLE001
+        return "(psutil missing)"
+
+
 def load_text_encoder(
     text_encoder_ckpt: str,
     device: torch.device = torch.device("cpu"),
     torch_dtype: torch.dtype = torch.bfloat16,
     cpu_offload: bool = False,
 ):
+    print(f"#####[TE] before from_pretrained {_commit_gb()}", flush=True)
     model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
         text_encoder_ckpt,
         dtype=torch_dtype,
         local_files_only=True,
         attn_implementation="sdpa",
     )
+    print(f"#####[TE] after from_pretrained {_commit_gb()}", flush=True)
     if cpu_offload:
         # The 7B text encoder runs only at session start / KV reset, so it stays
         # in CPU RAM and streams through the GPU during encode_prompt (~0 resident).
@@ -40,11 +56,13 @@ def load_text_encoder(
             except RuntimeError as exc:
                 logger.warning(f"Text encoder offload: pin_memory failed ({exc!r}); using pageable RAM")
                 state_dict = None
+        print(f"#####[TE] before cpu_offload {_commit_gb()}", flush=True)
         _accelerate_cpu_offload(
             model,
             execution_device=torch.device(device),
             state_dict=state_dict,
         )
+        print(f"#####[TE] after cpu_offload {_commit_gb()}", flush=True)
         logger.info(f"Text encoder: sequential CPU offload enabled (execution device {device})")
     else:
         model = model.to(device).eval().requires_grad_(False)
@@ -164,6 +182,73 @@ def _move_dit_to_device_lowvram(model: torch.nn.Module, device: torch.device) ->
     return model
 
 
+
+def _load_int8_inplace(model, directory, collect_blocks: bool = False, store=None):
+    """Dequantise an int8 export straight into `model` (no full bf16 state dict).
+
+    Shards are split by tensor name, so a `.q8weight` and its `.q8scales` can live
+    in different files: index every tensor first, then pair them up.
+    """
+    import json
+    from pathlib import Path
+
+    from safetensors import safe_open
+
+    root = Path(directory)
+    state = model.state_dict()
+    where = {}
+    for path in sorted(root.glob("*.safetensors")):
+        with safe_open(str(path), framework="pt") as f:
+            for key in f.keys():
+                where[key] = path
+        print(f"#####[INT8-LOAD] indexed {path.name}", flush=True)
+
+    quantised = sorted(k[: -len(".q8weight")] for k in where if k.endswith(".q8weight"))
+    copied = 0
+    store = {} if store is None else store
+    for base in quantised:
+        if base not in state:
+            continue
+        if collect_blocks and base.startswith("double_blocks."):
+            layer = int(base.split(".")[1])
+            # descriptor only: the shard stays mmapped and is read when paged in
+            store.setdefault(layer, {})[base.split(".", 2)[2]] = (
+                str(where[base + ".q8weight"]),
+                base + ".q8weight",
+                str(where[base + ".q8scales"]),
+                base + ".q8scales",
+            )
+            if len(store) % 4 == 0 and sum(len(v) for v in store.values()) % 40 == 0:
+                print(f"#####[INT8-LOAD] collect {sum(len(v) for v in store.values())} tensors", flush=True)
+            continue
+        with safe_open(str(where[base + ".q8weight"]), framework="pt") as fq:
+            q = fq.get_tensor(base + ".q8weight")
+        with safe_open(str(where[base + ".q8scales"]), framework="pt") as fs:
+            sc = fs.get_tensor(base + ".q8scales")
+        state[base].copy_((q.float() * sc.float()).to(torch.bfloat16))
+        copied += 1
+        if copied % 100 == 0:
+            print(f"#####[INT8-LOAD] {copied}/894 tensors", flush=True)
+
+    for key, path in where.items():
+        if key.endswith(".q8weight") or key.endswith(".q8scales") or key not in state:
+            continue
+        if collect_blocks and key.startswith("double_blocks."):
+            layer = int(key.split(".")[1])
+            with safe_open(str(path), framework="pt") as f:
+                store.setdefault(layer, {})[key.split(".", 2)[2]] = f.get_tensor(key).clone()
+            continue
+        with safe_open(str(path), framework="pt") as f:
+            state[key].copy_(f.get_tensor(key))
+        copied += 1
+
+    del state
+    logger.info(f"int8 stream load: {copied} tensors dequantised straight into the model")
+    if collect_blocks:
+        logger.info(f"int8 lazy blocks: {len(store)} layers kept int8 in host RAM")
+    return store
+
+
 def load_dit(cfg, device: torch.device) -> torch.nn.Module:
     from xvideo.lowvram import low_vram_enabled
 
@@ -172,7 +257,10 @@ def load_dit(cfg, device: torch.device) -> torch.nn.Module:
 
     state_dict = None
     _int4_dir = os.environ.get("JOYOMNI_DIT_INT4_DIR", "").strip()
-    if _int4_dir:
+    _stream_load = os.environ.get("JOYOMNI_INT8_STREAM_LOAD", "").strip().lower() in {
+        "1", "true", "yes", "on"
+    }
+    if _int4_dir and not _stream_load:
         from xvideo.models.dit.int4_linear import load_int4_state_dict
         logger.info(f"Loading int4 DiT from {_int4_dir} (dequantised to bf16)")
         state_dict = load_int4_state_dict(
@@ -186,7 +274,7 @@ def load_dit(cfg, device: torch.device) -> torch.nn.Module:
         logger.info(f"Loading DiT from safetensors dir {_sd_dir}")
         state_dict = load_safetensors_state_dict(_sd_dir)
         logger.info(f"safetensors state_dict ready: {len(state_dict)} tensors")
-    elif cfg.dit_ckpt is not None:
+    elif cfg.dit_ckpt is not None and not (_int4_dir and _stream_load):
         logger.info(f"Loading DiT checkpoint: {cfg.dit_ckpt}")
         # No mmap on HF Spaces: /data is FUSE, page faults crawl (hours for 30 GiB).
         mmap_ok = "SPACE_ID" not in os.environ
@@ -198,21 +286,56 @@ def load_dit(cfg, device: torch.device) -> torch.nn.Module:
     # Low-VRAM: build + fill on CPU, then stage blocks to the GPU as FP8 (the
     # bf16 model alone would already overflow a 32GB card).
     build_device = torch.device("cpu") if low_vram else device
-    model = Transformer3DModel(
-        dtype=dtype, device=build_device, **_arch_params(cfg.dit_arch_config)
-    )
+    _lazy_blocks = os.environ.get("JOYOMNI_INT8_LAZY_BLOCKS", "").strip().lower() in {
+        "1", "true", "yes", "on"
+    }
+    if _lazy_blocks:
+        # blocks are paged from the int8 store: never allocate their bf16 copies
+        build_device = torch.device("meta")
+    if build_device.type == "meta":
+        with torch.device("meta"):
+            model = Transformer3DModel(
+                dtype=dtype, device=build_device, **_arch_params(cfg.dit_arch_config)
+            )
+    else:
+        model = Transformer3DModel(
+            dtype=dtype, device=build_device, **_arch_params(cfg.dit_arch_config)
+        )
     model.to(device=build_device)
+    if build_device.type == "meta":
+        # materialise only the tensors that are not paged (embeddings, head, ...)
+        for mod_name, module in model.named_modules():
+            if mod_name == "double_blocks" or mod_name.startswith("double_blocks."):
+                continue
+            for n, prm in list(module._parameters.items()):
+                if prm is not None:
+                    module._parameters[n] = torch.nn.Parameter(
+                        torch.empty(prm.shape, dtype=prm.dtype, device="cpu"), requires_grad=False
+                    )
+            for n, buf in list(module._buffers.items()):
+                if buf is not None:
+                    module._buffers[n] = torch.empty(buf.shape, dtype=buf.dtype, device="cpu")
+        print("#####[DIT] meta skeleton materialised (non-block tensors only)", flush=True)
+        # the constructor leaves a few params in float32; the forward runs bf16
+        with torch.no_grad():
+            for name, prm in model.named_parameters():
+                if not name.startswith("double_blocks.") and prm.dtype != dtype:
+                    prm.data = prm.data.to(dtype)
+            for name, buf in model.named_buffers():
+                if not name.startswith("double_blocks.") and buf.is_floating_point() and buf.dtype != dtype:
+                    buf.data = buf.data.to(dtype)
 
-    if state_dict is not None:
+    if state_dict is not None or (_int4_dir and _stream_load):
+        load_state_dict = None
         for prefix in ("model.", "module.", "transformer."):
-            if any(k.startswith(prefix) for k in state_dict):
+            if state_dict is not None and any(k.startswith(prefix) for k in state_dict):
                 state_dict = {
                     (k[len(prefix):] if k.startswith(prefix) else k): v
                     for k, v in state_dict.items()
                 }
 
-        load_state_dict = {}
-        for k, v in state_dict.items():
+        load_state_dict = {} if state_dict is not None else None
+        for k, v in (state_dict or {}).items():
             if (
                 k == "img_in.weight" and
                 hasattr(model, "img_in") and
@@ -222,19 +345,51 @@ def load_dit(cfg, device: torch.device) -> torch.nn.Module:
                 v = v.reshape_as(v.new_zeros(model.img_in.weight.shape))
             load_state_dict[k] = v
 
-        missing_keys, unexpected_keys = model.load_state_dict(load_state_dict, strict=True)
+        print(f"#####[DIT] before load {_commit_gb()}", flush=True)
+        missing_keys, unexpected_keys = [], []
+        _lazy_blocks = os.environ.get("JOYOMNI_INT8_LAZY_BLOCKS", "").strip().lower() in {
+            "1", "true", "yes", "on"
+        }
+        if _int4_dir and _stream_load:
+            if _lazy_blocks:
+                # Bind the block tensors to GPU slots FIRST: that drops the bf16
+                # host copies (32.5 GiB) before the int8 store (15 GiB) is read,
+                # so the two never coexist.
+                from xvideo.models.dit.dit import _ensure_block_pager, _ensure_text_pager
+
+                _store: dict = {}
+                model._int8_block_store = _store
+                _ensure_text_pager(model, device_obj)
+                _ensure_block_pager(model, device_obj)
+                print("#####[INT8-LAZY] pagers bound, collecting int8 store", flush=True)
+                _load_int8_inplace(model, _int4_dir, collect_blocks=True, store=_store)
+                print("#####[INT8-LAZY] int8 store ready", flush=True)
+                logger.info("int8 lazy blocks: block tensors rebound to GPU slots")
+            else:
+                _load_int8_inplace(model, _int4_dir)
+        if load_state_dict is not None:
+            missing_keys, unexpected_keys = model.load_state_dict(load_state_dict, strict=True)
         if missing_keys:
             logger.warning(f"Missing keys when loading DiT: {missing_keys[:20]}")
         if unexpected_keys:
             logger.warning(f"Unexpected keys when loading DiT: {unexpected_keys[:20]}")
 
+    print(f"#####[DIT] after load {_commit_gb()}", flush=True)
     total_params = sum(p.numel() for p in model.parameters())
     logger.info(f"Instantiate model with {total_params / 1e9:.2f}B parameters")
 
     param_dtypes = {param.dtype for param in model.parameters()}
     if len(param_dtypes) > 1:
-        logger.warning(f"Model has mixed dtypes: {param_dtypes}. Converting to {dtype}")
-        model = model.to(dtype)
+        # NB: model.to(dtype) needs a second full copy (~32 GB for the DiT), which
+        # does not fit next to the loaded weights on a 64 GB box. Cast in place.
+        logger.warning(f"Model has mixed dtypes: {param_dtypes}. Casting in place to {dtype}")
+        with torch.no_grad():
+            for _, param in model.named_parameters():
+                if param.dtype != dtype:
+                    param.data = param.data.to(dtype)
+            for _, buf in model.named_buffers():
+                if buf.is_floating_point() and buf.dtype != dtype:
+                    buf.data = buf.data.to(dtype)
 
     stream_dit = low_vram and os.environ.get("JOYOMNI_STREAM_DIT", "").strip().lower() in {
         "1", "true", "yes", "on"
@@ -248,7 +403,7 @@ def load_dit(cfg, device: torch.device) -> torch.nn.Module:
             if name == "double_blocks":
                 continue
             child.to(device_obj)
-        for block in model.double_blocks:
+        for block in [] if getattr(model, "_int8_block_store", None) else model.double_blocks:
             # quantise on the GPU then park: the CUDA FP8 cast rounds slightly
             # differently from the CPU one, and the mismatch compounds over 40
             # layers (measured 28.6 dB against the resident build).

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn as nn
 
@@ -8,6 +10,15 @@ from xvideo.inductor_autotune_fix import install as _install_autotune_fix
 # Must run before any compiled function executes, so warm restarts reuse the
 # on-disk autotune results instead of re-running coordinate descent.
 _install_autotune_fix()
+
+
+def _channels_last_3d_ok() -> bool:
+    """channels_last_3d Conv3d crashes natively on ROCm/RDNA2 (MIOpen CK)."""
+    if os.environ.get("JOYOMNI_VAE_CHANNELS_LAST", "1").strip().lower() in {
+        "0", "false", "no", "off"
+    }:
+        return False
+    return torch.version.hip is None
 
 
 _configured: set[int] = set()
@@ -19,6 +30,11 @@ def maybe_setup_decode(vae) -> None:
     if id(vae) in _configured:
         return
     n_conv = 0
+    if not _channels_last_3d_ok():
+        vae.eval()
+        _configured.add(id(vae))
+        print("[vae_compile] channels_last_3d disabled (ROCm); running the VAE eagerly")
+        return
     for m in vae.modules():
         if isinstance(m, nn.Conv3d):
             m.weight.data = m.weight.data.to(memory_format=torch.channels_last_3d)
@@ -36,6 +52,8 @@ def maybe_setup_decode(vae) -> None:
 
 
 def prep_input(z: torch.Tensor) -> torch.Tensor:
+    if not _channels_last_3d_ok():
+        return z
     return z.to(memory_format=torch.channels_last_3d)
 
 
@@ -144,6 +162,9 @@ def warmup_decode(vae, latent_channels: int, h_lat: int, w_lat: int,
                   device: torch.device, dtype: torch.dtype,
                   temporal_lens: tuple[int, ...] = (1, 2),
                   autocast: bool = True) -> None:
+    if not _channels_last_3d_ok():
+        print("[vae_compile] decode warmup skipped (ROCm: channels_last_3d disabled)")
+        return
     maybe_setup_decode(vae)
     from contextlib import nullcontext
     dev_type = torch.device(device).type

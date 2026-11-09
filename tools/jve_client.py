@@ -62,6 +62,8 @@ async def main() -> None:
                     help="wait for each 8-frame chunk's output before sending the next")
     ap.add_argument("--profile", action="store_true", help="ask the server for per-chunk timings")
     ap.add_argument("--stall-timeout", type=float, default=90.0)
+    ap.add_argument("--max-temporal-ids", type=int, default=8,
+                    help="cap on KV temporal ids per chunk (smaller = less VRAM)")
     ap.add_argument("--tail-wait", type=float, default=90.0)
     args = ap.parse_args()
 
@@ -76,6 +78,7 @@ async def main() -> None:
         "fps": args.fps,
         "input_codec": "mjpeg",
         "output_codec": "mjpeg",
+        "max_temporal_ids": args.max_temporal_ids,
         "output_quality": args.quality,
         "use_pe": False,
         # keep the wire protocol in camera mode even for file sources: file mode

@@ -1,6 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import os as _os
+if _os.environ.get("JOYOMNI_DISABLE_MIOPEN", "").strip().lower() in {"1", "true", "yes", "on"}:
+    try:
+        import torch as _torch
+        _torch.backends.miopen.enabled = False
+        print("#####[ROCm] MIOpen disabled; conv3d falls back to the generic path", flush=True)
+    except Exception:
+        pass
 import asyncio
 import base64
 import io
@@ -2010,6 +2018,9 @@ def create_app(args: argparse.Namespace) -> FastAPI:
                     await _send_json({"type": "error", "message": msg})
                     break
                 except Exception as exc:
+                    import traceback as _tb
+                    _tb.print_exc()
+                    print(f"#####[WS-EXC] {exc!r}", flush=True)
                     await _send_json({"type": "error", "message": repr(exc)})
                     break
                 if isinstance(chunk_results, tuple) and chunk_results and isinstance(chunk_results[0], str):
@@ -2222,7 +2233,7 @@ def main() -> None:
     from xvideo.lowvram import apply_vram_cap_for_testing
     apply_vram_cap_for_testing(args.device)
     app = create_app(args)
-    uvicorn.run(app, host=args.host, port=args.port, log_level="info", ws_max_size=32 * 1024 * 1024, ws_per_message_deflate=False, loop="uvloop")
+    uvicorn.run(app, host=args.host, port=args.port, log_level="info", ws_max_size=32 * 1024 * 1024, ws_per_message_deflate=False, loop=("asyncio" if sys.platform == "win32" else "uvloop"))
 
 
 if __name__ == "__main__":

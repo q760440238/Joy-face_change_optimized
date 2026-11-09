@@ -245,6 +245,58 @@ def _bind_tensor(obj, name, tensor, is_param: bool) -> None:
         obj._buffers[name] = tensor
 
 
+def _dequant_into(slot, entry, owner, device) -> None:
+    """int8 + per-row scales -> bf16 slot (GPU), in row chunks.
+
+    `entry` is either a (q, scales) pair held in host RAM or a
+    (shard_path, q_key, scales_key) descriptor read from the mmap on demand.
+    """
+    if isinstance(entry, tuple) and len(entry) == 4 and isinstance(entry[0], str):
+        q_path, q_key, sc_path, sc_key = entry
+        from safetensors import safe_open
+
+        hq = owner._files.get(q_path)
+        if hq is None:
+            hq = safe_open(q_path, framework="pt")
+            owner._files[q_path] = hq
+        hs = owner._files.get(sc_path)
+        if hs is None:
+            if sc_path == q_path:
+                hs = hq
+            else:
+                hs = safe_open(sc_path, framework="pt")
+            owner._files[sc_path] = hs
+        q = hq.get_tensor(q_key)
+        sc = hs.get_tensor(sc_key)
+    elif isinstance(entry, tuple) and len(entry) == 2:
+        q, sc = entry
+    else:
+        # plain bf16 tensor (mod / norm weights are not quantised)
+        if entry.device != slot.device or entry.dtype != slot.dtype:
+            slot.copy_(entry.to(device=slot.device, dtype=slot.dtype))
+        else:
+            slot.copy_(entry)
+        return
+    n = q.numel()
+    stage_key = "_q_stage"
+    if getattr(owner, "_buffers", None) is not None and len(owner._buffers) > 1:
+        # one staging tensor per buffer: the copy stream and the compute stream
+        # must not share it
+        stage_key = f"_q_stage_{len(owner._buffers)}_{id(slot) % 2}"
+    stage = getattr(owner, stage_key, None)
+    if stage is None or stage.numel() < n:
+        stage = torch.empty(n, dtype=torch.int8, device=device)
+        setattr(owner, stage_key, stage)
+    qg = stage[:n].view(q.shape)
+    qg.copy_(q, non_blocking=True)
+    # bf16 throughout: a float32 temp doubles the peak for no visible gain
+    scg = sc.to(device, non_blocking=True).to(slot.dtype)
+    rows = max(1, (1 << 21) // max(q.shape[1], 1))
+    for r0 in range(0, q.shape[0], rows):
+        r1 = min(r0 + rows, q.shape[0])
+        slot[r0:r1].copy_(qg[r0:r1].to(slot.dtype).mul_(scg[r0:r1]))
+
+
 class _TextStreamPager:
     """Keep the text weights in host RAM and page them in one block at a time.
 
@@ -253,18 +305,36 @@ class _TextStreamPager:
     current stream, so they are ordered with the block's kernels.
     """
 
-    def __init__(self, transformer, device: torch.device):
+    def __init__(self, transformer, device: torch.device, int8_store=None):
         blocks = list(transformer.double_blocks)
         template = list(_text_tensor_chains(blocks[0]))
         self.device = device
         self.blocks = blocks
         self.specs = [(chain, is_param) for chain, is_param, _ in template]
+        self.int8_store = int8_store
+        self.paths = [".".join(chain) for chain, _ in self.specs]
+        self._q_stage = None
+        self._files = {}
+        self._files = {}
         self.slots = [
-            torch.empty_strided(tensor.size(), tensor.stride(), dtype=tensor.dtype, device=device)
+            torch.empty_strided(
+                tensor.size(),
+                tensor.stride(),
+                dtype=torch.bfloat16 if tensor.is_floating_point() else tensor.dtype,
+                device=device,
+            )
             for _, _, tensor in template
         ]
         self.hosts: list[list[torch.Tensor]] = []
         pinned = 0
+        if int8_store is not None:
+            for block in blocks:
+                for (chain, is_param), slot in zip(self.specs, self.slots):
+                    obj, name = _resolve_chain(block, chain)
+                    _bind_tensor(obj, name, slot, is_param)
+            self.pinned_tensors = 0
+            self.bytes = sum(t.numel() * t.element_size() for t in self.slots)
+            return
         for block in blocks:
             hosts = []
             for chain, is_param in self.specs:
@@ -289,12 +359,20 @@ class _TextStreamPager:
             _bind_tensor(obj, name, tensor, is_param)
 
     def page_in(self, layer_idx: int) -> None:
+        if self.int8_store is not None:
+            entries = self.int8_store[layer_idx]
+            for slot, path in zip(self.slots, self.paths):
+                _dequant_into(slot, entries[path], self, self.device)
+            self._bind(layer_idx, self.slots)
+            return
         hosts = self.hosts[layer_idx]
         for slot, host in zip(self.slots, hosts):
             slot.copy_(host, non_blocking=True)
         self._bind(layer_idx, self.slots)
 
     def page_out(self, layer_idx: int) -> None:
+        if self.int8_store is not None:
+            return
         # Inference never writes the weights, so the host mirrors are still
         # authoritative: rebinding is enough, no copy-back needed.
         self._bind(layer_idx, self.hosts[layer_idx])
@@ -315,18 +393,52 @@ class _BlockPager:
     page-in simply overwrites the slots.
     """
 
-    def __init__(self, transformer, device: torch.device):
+    def __init__(self, transformer, device: torch.device, int8_store=None):
         blocks = list(transformer.double_blocks)
         template = list(_stream_tensor_chains(blocks[0], _IMG_STREAM_ATTRS))
         self.device = device
         self.blocks = blocks
         self.specs = [(chain, is_param) for chain, is_param, _ in template]
+        self.int8_store = int8_store
+        self.paths = [".".join(chain) for chain, _ in self.specs]
+        self._q_stage = None
+        self._files = {}
         self.slots = [
-            torch.empty_strided(tensor.size(), tensor.stride(), dtype=tensor.dtype, device=device)
+            torch.empty_strided(
+                tensor.size(),
+                tensor.stride(),
+                dtype=torch.bfloat16 if tensor.is_floating_point() else tensor.dtype,
+                device=device,
+            )
             for _, _, tensor in template
         ]
         self.hosts: list[list[torch.Tensor]] = []
         pinned = 0
+        if int8_store is not None:
+            for block in blocks:
+                for (chain, is_param), slot in zip(self.specs, self.slots):
+                    obj, name = _resolve_chain(block, chain)
+                    _bind_tensor(obj, name, slot, is_param)
+            self._bound_once = True
+            self.pinned_tensors = 0
+            self.bytes = sum(t.numel() * t.element_size() for t in self.slots)
+            self.prefetch_enabled = stream_prefetch_enabled()
+            if self.prefetch_enabled:
+                self._buffers = [self.slots, self._alloc_buffer()]
+                self._copy_stream = torch.cuda.Stream(device=device)
+                self._ready = [torch.cuda.Event(), torch.cuda.Event()]
+                self._free = [None, None]
+                self._buffer = 0
+                self.bytes *= 2
+                print(
+                    "#####[BLOCK-PAGER] int8 double buffer enabled "
+                    f"({self.bytes / 2**20:.0f} MiB of GPU slots)",
+                    flush=True,
+                )
+            else:
+                self._buffers = [self.slots]
+                self._buffer = 0
+            return
         for block in blocks:
             hosts = []
             for chain, is_param in self.specs:
@@ -374,8 +486,13 @@ class _BlockPager:
         if wait is not None:
             self._copy_stream.wait_event(wait)
         with torch.cuda.stream(self._copy_stream):
-            for slot, host in zip(self._buffers[buf], self.hosts[layer_idx]):
-                slot.copy_(host, non_blocking=True)
+            if self.int8_store is not None:
+                entries = self.int8_store[layer_idx]
+                for slot, path in zip(self._buffers[buf], self.paths):
+                    _dequant_into(slot, entries[path], self, self.device)
+            else:
+                for slot, host in zip(self._buffers[buf], self.hosts[layer_idx]):
+                    slot.copy_(host, non_blocking=True)
             self._ready[buf].record(self._copy_stream)
 
     def use(self, layer_idx: int) -> None:
@@ -395,6 +512,11 @@ class _BlockPager:
         self._free[self._buffer] = event
 
     def page_in(self, layer_idx: int) -> None:
+        if self.int8_store is not None:
+            entries = self.int8_store[layer_idx]
+            for slot, path in zip(self.slots, self.paths):
+                _dequant_into(slot, entries[path], self, self.device)
+            return
         for slot, host in zip(self.slots, self.hosts[layer_idx]):
             slot.copy_(host, non_blocking=True)
 
@@ -403,7 +525,7 @@ def _ensure_block_pager(transformer, device) -> "_BlockPager":
     pager = getattr(transformer, "_block_stream_pager", None)
     if pager is None:
         started = time.time()
-        pager = _BlockPager(transformer, device)
+        pager = _BlockPager(transformer, device, getattr(transformer, "_int8_block_store", None))
         transformer._block_stream_pager = pager
         print(
             f"#####[BLOCK-PAGER] {pager.bytes / 2**20:.0f} MiB of GPU slots for "
@@ -417,7 +539,7 @@ def _ensure_text_pager(transformer, device) -> "_TextStreamPager":
     pager = getattr(transformer, "_text_stream_pager", None)
     if pager is None:
         started = time.time()
-        pager = _TextStreamPager(transformer, device)
+        pager = _TextStreamPager(transformer, device, getattr(transformer, "_int8_block_store", None))
         pager.blocks = transformer.double_blocks
         transformer._text_stream_pager = pager
         print(
@@ -509,8 +631,7 @@ def _sdpa_attention(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor)
         with sdpa_kernel(_SDPA_BACKENDS, set_priority=True):
             out = F.scaled_dot_product_attention(q, k, v, is_causal=False)
     except RuntimeError:
-        # ROCm / HIP builds have no cuDNN or flash kernels: the backend list
-        # raises "No available kernel". The math backend always works.
+        # ROCm/HIP builds have no cuDNN or flash kernels; the math backend works
         out = F.scaled_dot_product_attention(q, k, v, is_causal=False)
     return out.transpose(1, 2)
 
