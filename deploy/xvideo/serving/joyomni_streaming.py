@@ -365,7 +365,10 @@ class JoyOmniRuntime:
                     autocast=_vae_ac,
                 )
 
-            _ref_basesize = getattr(cfg, "ref_image_basesize", DEFAULT_REFERENCE_IMG_IV2V_BASESIZE)
+            _ref_basesize = int(
+                os.environ.get("JOYOMNI_REF_BASESIZE")
+                or getattr(cfg, "ref_image_basesize", DEFAULT_REFERENCE_IMG_IV2V_BASESIZE)
+            )
             _ref_cfgs = generate_video_image_bucket(
                 img_basesize=_ref_basesize, bs_img=1, bs_vid=0, bs_mimg=0, bs_mvid=0,
             )
@@ -1004,7 +1007,10 @@ class JoyOmniV2VStreamingSession:
         if self.ref_image is None:
             return None
 
-        ref_image_basesize = getattr(self.cfg, "ref_image_basesize", DEFAULT_REFERENCE_IMG_IV2V_BASESIZE)
+        ref_image_basesize = int(
+            os.environ.get("JOYOMNI_REF_BASESIZE")
+            or getattr(self.cfg, "ref_image_basesize", DEFAULT_REFERENCE_IMG_IV2V_BASESIZE)
+        )
         ref_image_bucket_configs = generate_video_image_bucket(
             img_basesize=ref_image_basesize,
             bs_img=1,
